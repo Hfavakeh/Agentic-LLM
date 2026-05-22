@@ -1,0 +1,27 @@
+# Build/runtime artifacts — keep the image small and the build context fast.
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Old run logs at repo root (hundreds of them).
+Agent_optimization_*.log
+*.log
+
+# Historical output directories and aggregated analysis — regenerated at runtime.
+outputs-*/
+analysis/
+
+# Reports / generated docs
+*.docx
+*.html
+
+# Local tooling
+.git/
+.gitignore
+.claude/
+.vscode/
+.idea/
+node_modules/
+
+# Keep datasets (preprocessed-*.csv) — they ARE needed inside the image.

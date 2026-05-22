@@ -1,0 +1,39 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"          # optional: expose to host for `ollama pull`
+    volumes:
+      - ollama-models:/root/.ollama   # persist pulled models across restarts
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  app:
+    build: .
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: "http://ollama:11434"   # autogen/ollama client reads this
+    volumes:
+      # Persist experiment outputs to the host. Pass `--output outputs/<name>`
+      # so results land here (the default --output writes to /app and is lost
+      # when the container is removed).
+      - ./outputs:/app/outputs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Override the default `python main.py` with run-specific flags, e.g.:
+    #   docker compose run --rm app --model qwen3:8b --rounds 10 --output outputs/run1
+    # command: ["--smoke-test"]
+
+volumes:
+  ollama-models:

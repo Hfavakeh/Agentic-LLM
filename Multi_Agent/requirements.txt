@@ -1,0 +1,8 @@
+# torch is provided by the pytorch CUDA base image (see Dockerfile).
+numpy
+pandas
+scikit-learn
+matplotlib
+pydantic
+autogen-core
+autogen-ext[ollama]
