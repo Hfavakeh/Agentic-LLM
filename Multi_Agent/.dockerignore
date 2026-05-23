@@ -23,5 +23,7 @@ analysis/
 .vscode/
 .idea/
 node_modules/
+.venv/
+venv/
 
 # Keep datasets (preprocessed-*.csv) — they ARE needed inside the image.
