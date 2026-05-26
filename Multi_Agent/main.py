@@ -227,10 +227,18 @@ def evaluate_setting(
         trainer.train()
         runtime_s = time.perf_counter() - _ts
 
+        # Dropout-off train loss on the restored best-epoch weights. The running
+        # train_loss in history is accumulated under model.train() (dropout on)
+        # and averaged over the epoch's changing weights, so it is biased high
+        # vs the eval-mode val_loss — making train/val gap spuriously negative
+        # even with zero overfitting. Re-measuring the train set in eval mode on
+        # the same best weights as val makes the gap a true generalisation
+        # signal. (Does not count toward runtime_s, measured above.)
+        clean_tr_loss, _ = trainer.validate(train_loader)
+
         h = trainer.history
         pos = [v for v in h.get("val_position_loss", []) if is_finite_number(v)]
         vl  = h.get("val_loss", [])
-        tl  = h.get("train_loss", [])
         if pos:
             best_pos = float(min(pos))
             val_rmse = float(np.sqrt(best_pos))
@@ -238,7 +246,7 @@ def evaluate_setting(
             val_rmse = float("inf")
         best_epoch = int(getattr(trainer, "best_epoch_in_call", 0) or (len(vl)))
         idx = max(0, min(best_epoch - 1, len(vl) - 1)) if vl else None
-        tr_at = float(tl[idx]) if idx is not None and idx < len(tl) and is_finite_number(tl[idx]) else float("nan")
+        tr_at = float(clean_tr_loss) if is_finite_number(clean_tr_loss) else float("nan")
         vl_at = float(vl[idx]) if idx is not None and is_finite_number(vl[idx]) else float("nan")
         per_seed.append({
             "seed":           int(seed),
@@ -966,12 +974,15 @@ def plot_optimization_trajectories(
 
     histories: {"Baseline": history_dict, "LLM": history_dict, ...}
     """
+    # Cycle styles by index so the plot never silently drops arms: zipping
+    # against a fixed 4-element list truncated to 4 lines, dropping the
+    # last-inserted history (Optuna).
     styles = ["-", "--", "-.", ":"]
     fig, ax = plt.subplots(figsize=(12, 6))
-    for (label, h), style in zip(histories.items(), styles):
+    for i, (label, h) in enumerate(histories.items()):
         vl = h.get("val_loss", [])
         if vl:
-            ax.plot(vl, lw=2, ls=style, label=label)
+            ax.plot(vl, lw=2, ls=styles[i % len(styles)], label=label)
     ax.set(xlabel="Epoch", ylabel="Validation Loss", title=title)
     ax.legend()
     ax.grid(alpha=0.3)
@@ -987,17 +998,30 @@ def _build_param_series_from_log(
     param: str,
     default_value: float,
 ) -> Dict[str, List[float]]:
+    def _as_float(v: Any) -> Optional[float]:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return None
+        return f if is_finite_number(f) else None
+
+    init = _as_float(opt_log.get("initial_hyperparameters", {}).get(param))
+    current = init if init is not None else float(default_value)
     rounds = [0]
-    values = [float(opt_log.get("initial_hyperparameters", {}).get(param, default_value))]
-    current = values[0]
+    values = [current]
 
     for rd in sorted(opt_log.get("rounds", []), key=lambda x: x.get("round", 0)):
         r = int(rd.get("round", 0))
         changes = rd.get("changes_applied", {}) or {}
         if param in changes:
-            current = float(changes[param])
+            # Rejected / malformed proposals (e.g. an LLM emitting prose where a
+            # number belongs) are still logged but were never validly applied,
+            # so they must not move the trajectory line.
+            parsed = _as_float(changes[param])
+            if parsed is not None:
+                current = parsed
         rounds.append(r)
-        values.append(float(current))
+        values.append(current)
 
     return {"rounds": rounds, "values": values}
 

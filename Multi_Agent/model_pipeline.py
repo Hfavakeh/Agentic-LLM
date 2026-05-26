@@ -949,7 +949,13 @@ class Trainer:
 
             if primary_metric < self.best_metric - 1e-9:
                 self.best_metric = primary_metric
-                name = f"{self.checkpoint_prefix}_best_{int(time.time())}.pt"
+                # Stable per-prefix name (no timestamp): each new Trainer
+                # overwrites its own prefix file instead of leaving a fresh
+                # snapshot behind every training, which otherwise accumulates
+                # thousands of orphaned .pt files (~26 GB/run). The only reader,
+                # restore_best_checkpoint(), runs on the same trainer right
+                # after training, so overwriting across trainers is safe.
+                name = f"{self.checkpoint_prefix}_best.pt"
                 if self.best_checkpoint_path and self.best_checkpoint_path.exists():
                     try:
                         self.best_checkpoint_path.unlink()
