@@ -9,11 +9,23 @@ Agent_optimization_*.log
 *.log
 
 # Historical output directories and aggregated analysis — regenerated at runtime.
+# Note: `outputs-*/` does NOT match the plain `outputs/` dir, so list it too.
 outputs-*/
+outputs/
 analysis/
+
+# Model checkpoints & generated artifacts — never needed in the image, and the
+# main cause of a multi-GB build context / hours-long `COPY . .` step.
+*.pt
+*.pth
+*.ckpt
+*.png
+*.rar
 
 # Reports / generated docs
 *.docx
+*.pdf
+*.pptx
 *.html
 
 # Local tooling

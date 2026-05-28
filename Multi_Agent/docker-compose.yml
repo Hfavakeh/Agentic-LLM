@@ -20,9 +20,15 @@ services:
     environment:
       OLLAMA_HOST: "http://ollama:11434"   # autogen/ollama client reads this
     volumes:
+      # Live-mount the source tree over the image's /app so CODE changes need NO
+      # rebuild — `git pull` then `docker compose run --rm app ...` picks them up.
+      # (The image still COPYs the code at build time as a fallback; this mount
+      # shadows it at runtime.)
+      - .:/app
       # Persist experiment outputs to the host. Pass `--output outputs/<name>`
       # so results land here (the default --output writes to /app and is lost
-      # when the container is removed).
+      # when the container is removed). More specific than `.:/app`, so this
+      # subdir mount wins for outputs/.
       - ./outputs:/app/outputs
     deploy:
       resources:

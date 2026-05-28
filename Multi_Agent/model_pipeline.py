@@ -619,6 +619,11 @@ class Trainer:
             # Plain position MSE per epoch — diverges from `val_loss` once
             # motion-aware loss shaping is active; used for true RMSE.
             "val_position_loss": [],
+            # Same plain position MSE but in ORIGINAL units (metres), i.e.
+            # computed on inverse-transformed preds/targets. This is the
+            # selection objective so search ranking matches the meters-space
+            # test RMSE the headline reports (compute_metrics).
+            "val_position_loss_m": [],
         }
         self.hyperparams = {
             "learning_rate":    config.learning_rate,
@@ -641,7 +646,8 @@ class Trainer:
         self.best_checkpoint_path: Optional[Path] = None
         self._cached_val_distance_m: Optional[float] = None   # updated each validate() call
         self._cached_val_distance_std_m: Optional[float] = None  # std of per-sample Euclidean error (m)
-        self._cached_val_position_loss: Optional[float] = None  # plain MSE, updated each validate()
+        self._cached_val_position_loss: Optional[float] = None  # plain MSE (scaled space), updated each validate()
+        self._cached_val_position_loss_m: Optional[float] = None  # plain MSE in metres, updated each validate()
         # Motion-aware loss shaping. Starts at defaults (= plain MSE); a
         # controller overrides entries via apply_loss_shaping_update().
         # `bin_edges` are fixed speed thresholds from the dataset (terciles of
@@ -885,6 +891,7 @@ class Trainer:
                     self._cached_val_distance_m = None
                     self._cached_val_distance_std_m = None
                     self._cached_val_position_loss = None
+                    self._cached_val_position_loss_m = None
                     return float("nan"), float("nan")
                 n = y_batch.size(0)
                 total_loss += loss.item() * n
@@ -902,9 +909,15 @@ class Trainer:
             per_sample_dist = np.sqrt(np.sum((p_inv - t_inv) ** 2, axis=1))
             self._cached_val_distance_m     = float(np.mean(per_sample_dist))
             self._cached_val_distance_std_m = float(np.std(per_sample_dist))
+            # Metres-space position MSE, same functional as compute_metrics'
+            # RMSE (mean of squared error over all elements). sqrt of this is
+            # the selection objective, so search ranks on the same quantity the
+            # headline test RMSE uses — just on the validation set.
+            self._cached_val_position_loss_m = float(np.mean((p_inv - t_inv) ** 2))
         except Exception:
             self._cached_val_distance_m     = None
             self._cached_val_distance_std_m = None
+            self._cached_val_position_loss_m = None
 
         # Plain position MSE (prior-free) — kept separate from the shaped
         # `val_loss` so reported RMSE = sqrt(position MSE) stays a true RMSE.
@@ -915,11 +928,14 @@ class Trainer:
     def train(self, train_loader=None, val_loader=None) -> Dict:
         """Full training loop with early stopping.
 
-        Early-stopping rule (identical for every arm): monitor validation loss;
-        if it does not improve for `patience` consecutive epochs, stop and
-        restore the best-epoch weights. `patience` is the per-setting HP
-        (8/12/16), falling back to the config default. State is local to this
-        call, so each from-scratch training is judged on its own best epoch.
+        Early-stopping rule (identical for every arm): monitor the validation
+        position MSE in METRES (`val_position_loss_m` — the same metric the
+        search score and the headline test RMSE use); if it does not improve for
+        `patience` consecutive epochs, stop and restore the best-epoch weights.
+        Falls back to the scaled `val_loss` only on epochs where the metres
+        metric is unavailable. `patience` is the per-setting HP (8/12/16),
+        falling back to the config default. State is local to this call, so each
+        from-scratch training is judged on its own best epoch.
         """
         if train_loader is not None:
             self.train_loader = train_loader
@@ -948,6 +964,10 @@ class Trainer:
             self.history["val_position_loss"].append(
                 float(self._cached_val_position_loss)
                 if self._cached_val_position_loss is not None else float("nan")
+            )
+            self.history["val_position_loss_m"].append(
+                float(self._cached_val_position_loss_m)
+                if self._cached_val_position_loss_m is not None else float("nan")
             )
 
             logger.info(
@@ -999,10 +1019,20 @@ class Trainer:
                 # `epochs_since_improvement` plateau signal.
                 self.patience_counter += 1
 
-            # ── Early stopping (validation-loss based, same rule for all arms) ──
-            if es_enabled and np.isfinite(vl_loss):
-                if vl_loss < es_best - 1e-6:
-                    es_best       = float(vl_loss)
+            # ── Early stopping (metres position-MSE based, same rule for all
+            # arms). Monitoring the same metric the search ranks on and the
+            # headline reports means the kept epoch, the score, and the test
+            # metric all agree. Fall back to scaled val_loss only if the metres
+            # metric is unavailable this epoch. ──
+            es_metric = (
+                float(self._cached_val_position_loss_m)
+                if (self._cached_val_position_loss_m is not None
+                    and np.isfinite(self._cached_val_position_loss_m))
+                else float(vl_loss)
+            )
+            if es_enabled and np.isfinite(es_metric):
+                if es_metric < es_best - 1e-9:
+                    es_best       = float(es_metric)
                     es_best_state = copy.deepcopy(self.model.state_dict())
                     es_counter    = 0
                     self.best_epoch_in_call = epoch + 1
@@ -1010,10 +1040,11 @@ class Trainer:
                     es_counter += 1
                     if es_counter >= es_patience:
                         logger.info(
-                            "Early stopping at epoch %d/%d (no val-loss improvement "
-                            "for %d epochs; best epoch %d, val_loss %.5f).",
+                            "Early stopping at epoch %d/%d (no val position-MSE "
+                            "(m) improvement for %d epochs; best epoch %d, "
+                            "val_pos_mse_m %.5f, RMSE_m %.5f).",
                             epoch + 1, self.config.epochs, es_patience,
-                            self.best_epoch_in_call, es_best,
+                            self.best_epoch_in_call, es_best, float(np.sqrt(es_best)),
                         )
                         break
 

@@ -65,8 +65,7 @@ from motion_descriptors import (
 # so every run of the experiment is reproducible.
 EXPERIMENT_SEEDS: List[int] = [
     17, 42, 73, 128, 256, 314, 451, 512, 666, 777,
-    888, 1024, 1234, 1492, 1618, 1729, 2003, 2048, 2718, 3141,
-    4096, 4242, 5000, 5678, 6174, 7777, 8191, 8675, 9001, 9999,
+   
 ]
 
 # Protocol seeds. The same three fixed seeds train EVERY setting in EVERY arm,
@@ -179,8 +178,12 @@ def evaluate_setting(
     return its averaged validation result.
 
     score == val_rmse_mean == mean over seeds of the best-epoch validation
-    RMSE (sqrt of the lowest per-epoch position MSE). Lower is better. This is
-    the single number the optimizer ranks settings by.
+    RMSE in METRES (sqrt of the position MSE on inverse-transformed
+    preds/targets, evaluated at the early-stopping best epoch whose weights are
+    restored and carried to test). Lower is better. This is the single number
+    the optimizer ranks settings by; it uses the same RMSE functional and units
+    as the headline test RMSE (Evaluator.compute_metrics), so search selection
+    and final evaluation agree.
 
     The dataset's windows are rebuilt in place when the setting's window_size
     differs from the current one (raw splits are cached, so no CSV reload and
@@ -237,15 +240,20 @@ def evaluate_setting(
         clean_tr_loss, _ = trainer.validate(train_loader)
 
         h = trainer.history
-        pos = [v for v in h.get("val_position_loss", []) if is_finite_number(v)]
         vl  = h.get("val_loss", [])
-        if pos:
-            best_pos = float(min(pos))
-            val_rmse = float(np.sqrt(best_pos))
-        else:
-            val_rmse = float("inf")
         best_epoch = int(getattr(trainer, "best_epoch_in_call", 0) or (len(vl)))
         idx = max(0, min(best_epoch - 1, len(vl) - 1)) if vl else None
+        # Score in METRES (same functional as compute_metrics' test RMSE) at the
+        # epoch whose weights are actually restored/carried to test, so the
+        # ranking objective matches the headline metric and the model it grades.
+        pos_m = h.get("val_position_loss_m", [])
+        pos_at = (float(pos_m[idx]) if idx is not None and idx < len(pos_m)
+                  and is_finite_number(pos_m[idx]) else float("nan"))
+        if is_finite_number(pos_at):
+            val_rmse = float(np.sqrt(pos_at))
+        else:
+            finite_m = [v for v in pos_m if is_finite_number(v)]
+            val_rmse = float(np.sqrt(min(finite_m))) if finite_m else float("inf")
         tr_at = float(clean_tr_loss) if is_finite_number(clean_tr_loss) else float("nan")
         vl_at = float(vl[idx]) if idx is not None and is_finite_number(vl[idx]) else float("nan")
         per_seed.append({
