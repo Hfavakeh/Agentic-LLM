@@ -264,6 +264,29 @@ class Config:
             self.hz = float(spec["hz"])
             self.window_size = int(round(spec["hz"] * spec["window_seconds"]))
 
+        # ── Fair-comparison fix: baseline window must be reachable by the search ──
+        # The fixed-reference baseline trains at the dataset's spec window_size
+        # (radar=12, cap=15, IR=5), but the protocol search grid is a fixed list
+        # ([10,20,30,40,50]) that contains NONE of those. If the baseline's window
+        # is not in the grid, no search arm (random / Optuna / LLM / rule-based)
+        # can ever draw it, so none can reproduce — let alone beat — the baseline
+        # config. That made every arm lose to the baseline. Inject the baseline
+        # window into the shared grid so all arms and the baseline draw from one
+        # reachable search space. HP_GRID is the single source of truth read live
+        # by every arm/sampler/validator, so updating it once here (at Config
+        # construction, before any arm runs) keeps them all aligned.
+        if int(self.window_size) not in HP_GRID["window_size"]:
+            HP_GRID["window_size"] = sorted(
+                set(HP_GRID["window_size"]) | {int(self.window_size)}
+            )
+            HP_BOUNDS["window_size"] = (
+                min(HP_GRID["window_size"]), max(HP_GRID["window_size"]),
+            )
+            logger.info(
+                "Search grid: injected baseline window_size=%d -> window_size grid now %s",
+                int(self.window_size), HP_GRID["window_size"],
+            )
+
 
 # ---------------------------------------------------------------------------
 # Data

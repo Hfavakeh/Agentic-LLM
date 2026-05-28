@@ -855,6 +855,24 @@ def _qual_quality(score: Any, all_scores: List[float]) -> str:
     return "good" if frac < 0.34 else "average" if frac < 0.67 else "poor"
 
 
+def _qual_level_10(score: Any, all_scores: List[float]) -> Optional[int]:
+    """Map a setting's score onto a 1-10 quality level (1 = best, 10 = worst),
+    scaled between the best and worst finite scores seen so far.
+
+    The 3-bucket `_qual_quality` (best/good/average/poor) is too coarse for the
+    LLM to read a *trend* off a list of attempts; this finer ordinal lets it see
+    how much better/worse one setting is than another and which direction the
+    search is moving. Raw numbers still stay out of the prompt."""
+    finite = sorted(s for s in all_scores if is_finite_number(s))
+    if not finite or not is_finite_number(score):
+        return None
+    best, worst = finite[0], finite[-1]
+    if worst <= best:           # only one distinct value seen
+        return 1
+    frac = (float(score) - best) / (worst - best)   # 0 = best, 1 = worst
+    return int(round(1 + frac * 9))                  # 1..10
+
+
 def _behavior_label(variation: str, gap: str, quality: str) -> str:
     """Soft behavior label from the qualitative signals (email's label set)."""
     if variation == "high":
@@ -979,6 +997,10 @@ def format_protocol_payload(
     lines.append("  " + (_setting_line(anchor_setting, allow_arch_changes) or "(fixed-reference defaults)"))
     lines.append("")
 
+    def _level_str(h: Dict[str, Any]) -> str:
+        lvl = _qual_level_10(h.get("score"), all_scores)
+        return f"{lvl}/10" if lvl is not None else "unknown"
+
     def _qual_block(h: Dict[str, Any]) -> List[str]:
         q   = _qual_quality(h.get("score"), all_scores)
         var = _qual_variation(h.get("score"), h.get("val_rmse_std"))
@@ -986,48 +1008,55 @@ def format_protocol_payload(
         tim = _qual_epoch_timing(h.get("mean_best_epoch"), max_epochs)
         beh = _behavior_label(var, gap, q)
         return [
-            f"    validation quality: {q}",
+            f"    validation quality: {q} (level {_level_str(h)}, 1=best 10=worst)",
             f"    reliability across 3 trainings: {var}",
             f"    train/validation gap: {gap}",
             f"    best epoch timing: {tim}",
             f"    behavior label: {beh.replace('_', ' ')}",
         ]
 
-    # ── Best settings so far (top 5 by score) ────────────────────────────────
+    # ── Best settings so far (top 5, RANKED best → worst) ─────────────────────
     ranked = sorted(
         (h for h in history if is_finite_number(h.get("score"))),
         key=lambda h: float(h["score"]),
     )[:5]
-    lines.append("== BEST SETTINGS SO FAR ==")
+    lines.append("== BEST SETTINGS SO FAR (ranked #1 = best; level 1/10 = best) ==")
     if ranked:
-        for h in ranked:
-            lines.append(f"  [attempt {h.get('attempt')}] {_setting_line(h.get('setting', {}), allow_arch_changes)}")
+        for rank, h in enumerate(ranked, start=1):
+            lines.append(f"  #{rank} [attempt {h.get('attempt')}] (level {_level_str(h)}) "
+                         f"{_setting_line(h.get('setting', {}), allow_arch_changes)}")
             lines.extend(_qual_block(h))
     else:
         lines.append("  (none yet)")
     lines.append("")
 
-    # ── Last 5 attempts (recent direction of the search) ─────────────────────
-    lines.append("== LAST ATTEMPTS (most recent first) ==")
-    recent = list(reversed(history[-5:]))
+    # ── Last 5 attempts, in CHRONOLOGICAL order so the LLM can read the trend ──
+    # (oldest → newest). Each line carries the 1-10 quality level and an explicit
+    # direction vs the immediately preceding attempt, so the search trajectory is
+    # legible without raw numbers.
+    lines.append("== LAST ATTEMPTS (oldest → newest; watch the level trend, 1=best 10=worst) ==")
+    recent = history[-5:]
     if recent:
-        prev_best = None
+        prev_score = None
         for h in recent:
             chg = h.get("changes_from_anchor") or {}
             chg_str = ", ".join(f"{k}={_fmt_grid_val(v)}" for k, v in chg.items()) or "none"
             q = _qual_quality(h.get("score"), all_scores)
-            cmp_best = ""
-            if is_finite_number(h.get("score")) and is_finite_number(prev_best):
-                cmp_best = ("better" if h["score"] < prev_best * 0.98
-                            else "worse" if h["score"] > prev_best * 1.02 else "similar")
-            lines.append(f"  [attempt {h.get('attempt')}] changed: {chg_str}")
-            lines.append(f"    validation quality: {q}" + (f" ({cmp_best} than prior best)" if cmp_best else ""))
+            trend = ""
+            if is_finite_number(h.get("score")) and is_finite_number(prev_score):
+                trend = ("  ↓ improved" if h["score"] < prev_score * 0.98
+                         else "  ↑ worsened" if h["score"] > prev_score * 1.02
+                         else "  → about the same")
+            beh = _behavior_label(_qual_variation(h.get('score'), h.get('val_rmse_std')),
+                                  _qual_gap(h.get('mean_val_loss'), h.get('mean_train_val_gap')), q)
+            lines.append(f"  [attempt {h.get('attempt')}] level {_level_str(h)} ({q}){trend} | changed: {chg_str}")
             lines.append(f"    reliability: {_qual_variation(h.get('score'), h.get('val_rmse_std'))}"
                          f"  gap: {_qual_gap(h.get('mean_val_loss'), h.get('mean_train_val_gap'))}"
                          f"  best epoch: {_qual_epoch_timing(h.get('mean_best_epoch'), max_epochs)}")
-            lines.append(f"    behavior label: {_behavior_label(_qual_variation(h.get('score'), h.get('val_rmse_std')), _qual_gap(h.get('mean_val_loss'), h.get('mean_train_val_gap')), q).replace('_', ' ')}")
+            lines.append(f"    behavior label: {beh.replace('_', ' ')}")
             lines.append(f"    output: {h.get('output_status', 'clean')}")
-        # update prev_best for ordering note (not strictly needed)
+            if is_finite_number(h.get("score")):
+                prev_score = h["score"]
     else:
         lines.append("  (no attempts yet)")
     lines.append("")
