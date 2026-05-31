@@ -630,6 +630,26 @@ async def run_proposer_search(
         }
         proposal = await agent.propose_setting(context)
 
+        # Defense-in-depth: even after the proposer's own check, ensure we
+        # never re-train an already-tried setting. Rule-based now consults
+        # `is_tried` inside `_act_protocol`; LLM proposals go through
+        # `validate_protocol_changes` which also rejects `already_tried`. This
+        # guard catches anything that slips past — without it a stale
+        # controller could burn the whole 25-attempt budget re-evaluating one
+        # duplicate setting (the bug seen in pre-fix rule-based runs).
+        if proposal.get("valid"):
+            try:
+                candidate = _coerce_setting(proposal["resolved_setting"], allow_arch)
+                if is_tried(candidate):
+                    proposal = {
+                        **proposal,
+                        "valid": False,
+                        "failure_reason": "already_tried",
+                        "output_status": "rejected",
+                    }
+            except Exception:
+                pass  # malformed proposal falls through to the invalid branch below
+
         if not proposal.get("valid"):
             history.append({
                 "attempt": a, "round": a, "setting": dict(anchor),

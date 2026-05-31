@@ -5,7 +5,7 @@ import logging
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import numpy as np
 from pydantic import BaseModel, Field
@@ -2058,8 +2058,81 @@ w_res: <0.0 to 1.0>
 
 
 # ---------------------------------------------------------------------------
-# RuleBasedOptimizer
+# RuleBasedOptimizer — protocol candidate-move tables
 # ---------------------------------------------------------------------------
+#
+# Ordered list of single-HP (param, direction, strategy) moves per diagnosis.
+# `_act_protocol` walks the list and returns the first move whose value
+# actually differs from the anchor (not at a grid boundary) AND whose
+# resolved setting is not already-tried. This replaces the older
+# single-move-per-diagnosis rule that would deadlock once its preferred move
+# had been tried and not improved — without this priority list the
+# controller emits the same proposal every attempt forever whenever the
+# anchor doesn't change. Architectural moves are appended only when
+# allow_arch_changes is True. Frozen rules — never tuned after seeing
+# results, so the only difference vs the LLM remains *how* the diagnosis
+# label is acted on.
+
+_PROTOCOL_MOVES_BASE: Dict[str, List[Tuple[str, int, str]]] = {
+    "unstable": [
+        ("learning_rate", -1, "stabilise"),
+        ("batch_size",    -1, "stabilise"),
+        ("weight_decay",  +1, "stabilise"),
+        ("dropout",       +1, "stabilise"),
+        ("patience",      +1, "stabilise"),
+        ("learning_rate", +1, "stabilise"),
+    ],
+    "plateau": [
+        ("learning_rate", -1, "escape_plateau"),
+        ("learning_rate", +1, "escape_plateau"),
+        ("dropout",       -1, "escape_plateau"),
+        ("weight_decay",  -1, "escape_plateau"),
+        ("batch_size",    -1, "escape_plateau"),
+        ("patience",      +1, "escape_plateau"),
+    ],
+    "possible_overfitting_tendency": [
+        ("dropout",       +1, "regularise"),
+        ("weight_decay",  +1, "regularise"),
+        ("batch_size",    +1, "regularise"),
+        ("learning_rate", -1, "regularise"),
+    ],
+    "possible_underfitting_tendency": [
+        ("learning_rate", +1, "explore"),
+        ("dropout",       -1, "explore"),
+        ("weight_decay",  -1, "explore"),
+        ("window_size",   +1, "explore"),
+        ("batch_size",    -1, "explore"),
+    ],
+    "healthy": [
+        ("dropout",       +1, "exploit"),
+        ("dropout",       -1, "exploit"),
+        ("weight_decay",  +1, "exploit"),
+        ("weight_decay",  -1, "exploit"),
+        ("learning_rate", -1, "exploit"),
+        ("learning_rate", +1, "exploit"),
+        ("batch_size",    +1, "exploit"),
+        ("batch_size",    -1, "exploit"),
+        ("patience",      +1, "exploit"),
+        ("window_size",   +1, "explore"),
+        ("window_size",   -1, "explore"),
+    ],
+}
+
+# Arch-only moves, prepended for underfitting (capacity-first) and appended
+# for healthy (small-local-explore-first). Skipped when allow_arch_changes
+# is False.
+_PROTOCOL_ARCH_MOVES: Dict[str, List[Tuple[str, int, str]]] = {
+    "possible_underfitting_tendency": [
+        ("lstm_hidden", +1, "explore"),
+        ("lstm_layers", +1, "explore"),
+    ],
+    "healthy": [
+        ("lstm_hidden", +1, "explore"),
+        ("lstm_hidden", -1, "explore"),
+        ("lstm_layers", +1, "explore"),
+    ],
+}
+
 
 class RuleBasedOptimizer:
     """Deterministic, non-LLM hyperparameter controller.
@@ -2181,60 +2254,74 @@ class RuleBasedOptimizer:
         q   = _qual_quality(last.get("score"), all_scores)
         return _behavior_label(var, gap, q)
 
-    def _act_protocol(self, diagnosis: str, anchor: Dict[str, Any],
-                      allow_arch_changes: bool) -> tuple:
-        """Deterministic grid-stepped change vs the anchor (frozen rules):
-          unstable / plateau            -> learning_rate one step DOWN
-          possible overfitting tendency -> dropout one step UP (else weight_decay UP)
-          possible underfitting tendency-> lstm_hidden one step UP (arch on) else lr UP
-          healthy                       -> dropout one step UP (small local explore)
-          inconclusive                  -> no change (train the anchor / defaults)
-        Returns (changes, strategy)."""
-        changes: Dict[str, Any] = {}
-        lr = anchor.get("learning_rate")
-        do = anchor.get("dropout")
-        wd = anchor.get("weight_decay")
+    def _act_protocol(
+        self,
+        diagnosis: str,
+        anchor: Dict[str, Any],
+        allow_arch_changes: bool,
+        is_tried: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Pick a single-HP delta vs the anchor by walking the diagnosis's
+        priority list (`_PROTOCOL_MOVES_BASE` + optional `_PROTOCOL_ARCH_MOVES`),
+        skipping moves at a grid boundary (no actual change) and moves whose
+        resolved setting is already tried. Returns the first hit as
+        `(changes, strategy)`; returns `(None, "exhausted")` when every
+        candidate is a no-op or already-tried so the engine can mark the
+        attempt rejected instead of training a duplicate. On `"inconclusive"`
+        with an unseen anchor, returns `({}, "exploit")` so attempt 1 trains
+        the anchor (defaults) to establish a baseline data point — but if the
+        anchor is itself already-tried (e.g. attempt N after rejects), falls
+        through to the healthy moves so the budget isn't wasted re-evaluating.
+        Frozen rules — never tuned after seeing results.
+        """
+        if diagnosis == "inconclusive" and (is_tried is None or not is_tried(anchor)):
+            return {}, "exploit"
 
-        if diagnosis in ("unstable", "plateau"):
-            nv = _grid_neighbor("learning_rate", lr, -1)
-            if nv != lr:
-                changes["learning_rate"] = nv
-            return changes, "stabilise"
-        if diagnosis == "possible_overfitting_tendency":
-            nv = _grid_neighbor("dropout", do, +1)
-            if nv != do:
-                changes["dropout"] = nv
-            else:
-                wv = _grid_neighbor("weight_decay", wd, +1)
-                if wv != wd:
-                    changes["weight_decay"] = wv
-            return changes, "regularise"
-        if diagnosis == "possible_underfitting_tendency":
-            if allow_arch_changes:
-                hv = _grid_neighbor("lstm_hidden", anchor.get("lstm_hidden"), +1)
-                if hv != anchor.get("lstm_hidden"):
-                    changes["lstm_hidden"] = hv
-                    return changes, "explore"
-            nv = _grid_neighbor("learning_rate", lr, +1)
-            if nv != lr:
-                changes["learning_rate"] = nv
-            return changes, "explore"
-        if diagnosis == "healthy":
-            nv = _grid_neighbor("dropout", do, +1)
-            if nv != do:
-                changes["dropout"] = nv
-            return changes, "exploit"
-        return {}, "exploit"   # inconclusive
+        base  = _PROTOCOL_MOVES_BASE.get(diagnosis) or _PROTOCOL_MOVES_BASE["healthy"]
+        archs = _PROTOCOL_ARCH_MOVES.get(diagnosis, []) if allow_arch_changes else []
+        # Capacity-first for underfitting; small-local-explore-first elsewhere.
+        moves = (archs + list(base)) if diagnosis == "possible_underfitting_tendency" \
+                else (list(base) + archs)
+
+        for param, direction, strategy in moves:
+            cur = anchor.get(param)
+            nv  = _grid_neighbor(param, cur, direction)
+            if nv == cur:                 # grid boundary — move doesn't change anything
+                continue
+            candidate = {**anchor, param: nv}
+            if is_tried is not None and is_tried(candidate):
+                continue
+            return {param: nv}, strategy
+        return None, "exhausted"
 
     async def propose_setting(self, context: Dict[str, Any]) -> Dict[str, Any]:
-        """Deterministic protocol proposer: diagnose the last attempt, step one
-        grid value vs the anchor. Always returns a valid (in-grid) proposal."""
+        """Deterministic protocol proposer: diagnose the last attempt, then
+        walk the diagnosis's move-priority list to pick the first single-HP
+        delta that actually changes the anchor and isn't already-tried
+        (consuming `context["is_tried"]`, exposed by `run_proposer_search`).
+        Returns `valid=False, failure_reason="exhausted"` only when every
+        priority move would be a no-op or duplicate — in which case the
+        attempt is rejected by the engine like any other invalid proposal.
+        """
         anchor     = context.get("anchor_setting") or {}
         history    = context.get("history", [])
         allow_arch = context.get("allow_arch_changes", self.allow_arch_changes)
+        is_tried   = context.get("is_tried")
 
         diagnosis = self._diagnose_protocol(history)
-        changes, strategy = self._act_protocol(diagnosis, anchor, allow_arch)
+        changes, strategy = self._act_protocol(diagnosis, anchor, allow_arch, is_tried)
+
+        if changes is None:
+            return {
+                "valid":            False,
+                "proposed_changes": {},
+                "diagnosis":        diagnosis,
+                "strategy":         strategy,
+                "failure_reason":   "exhausted",
+                "output_status":    "rejected",
+                "confidence":       "high",
+            }
+
         resolved = {**anchor, **changes}
         return {
             "valid":            True,
