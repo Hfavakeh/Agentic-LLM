@@ -64,9 +64,7 @@ from motion_descriptors import (
 # 30 fixed, distinct, non-sequential seeds. Hard-coded (not randomly sampled)
 # so every run of the experiment is reproducible.
 EXPERIMENT_SEEDS: List[int] = [
-    17, 42, 73, 128, 256, 314, 451, 512, 666, 777,
-   
-]
+    17, 42, 73, 128, 256, 314, 451, 512, 666, 777]
 
 # Protocol seeds. The same three fixed seeds train EVERY setting in EVERY arm,
 # so the only thing that differs between attempts/arms is the setting itself.
@@ -968,10 +966,13 @@ def write_final_eval_report(config: Config, final_eval: Dict[str, Any], run_id: 
         )
     lines.append("")
     if paired:
-        lines += ["## Paired differences (LLM − method, per seed; negative = LLM better)", ""]
+        # ASCII '-' (not U+2212) so logger.info doesn't crash on Windows
+        # cp1252 consoles when echoing the table back; the .md file (UTF-8) is
+        # unaffected either way.
+        lines += ["## Paired differences (LLM - method, per seed; negative = LLM better)", ""]
         for key, p in paired.items():
             arm = key.replace("llm_minus_", "")
-            lines.append(f"- LLM − {label.get(arm, arm)}: {p['mean']:+.4f} ± {p['std']:.4f} "
+            lines.append(f"- LLM - {label.get(arm, arm)}: {p['mean']:+.4f} ± {p['std']:.4f} "
                          f"(LLM better on {p['llm_better_count']}/{p['n']} seeds)")
         lines.append("")
 

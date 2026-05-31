@@ -27,12 +27,28 @@ from torch.utils.data import DataLoader, Dataset
 # Logging
 # ---------------------------------------------------------------------------
 
+# Reconfigure the console streams to UTF-8 with replacement on Windows so the
+# StreamHandler below doesn't crash when a log line contains a glyph absent
+# from the default cp1252 codepage (e.g. U+2212 '-' in the final-eval report,
+# arrows in section headers). This was responsible for run-aborts mid-experiment
+# in seed_777 of the post-fix llama38b run — the report wrote fine to .md
+# (UTF-8) but the echo-to-console call raised UnicodeEncodeError and killed the
+# whole run before final_eval / cross_run_metrics could be saved.
+import sys as _sys
+for _stream in (_sys.stdout, _sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[
         logging.FileHandler(
-            f"Agent_optimization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            f"Agent_optimization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
+            encoding="utf-8",
         ),
         logging.StreamHandler(),
     ],
