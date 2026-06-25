@@ -335,7 +335,7 @@ def main() -> None:
         hz = float(args.hz)
     else:
         try:
-            from model_pipeline import get_dataset_spec  # avoids hard import cycle
+            from pipeline.datasets import get_dataset_spec  # lazy: keeps this script torch-free
             spec = get_dataset_spec(str(csv_path))
         except Exception:
             spec = None

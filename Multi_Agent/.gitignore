@@ -1,0 +1,33 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Experiment run logs (hundreds of historical Agent_optimization_*.log at root)
+*.log
+*.rar
+
+# Experiment outputs & generated analysis (regenerated per run)
+outputs/
+outputs-*/
+analysis/
+llm_behavior_analysis/
+_optuna_scratch/
+optuna_cache_*.json
+
+# Generated reports / binaries (regenerated from the build_*.js / *.py scripts)
+*.docx
+*.pptx
+*.pdf
+*.html
+human_knowledge_report.md
+
+# Scratch / console dumps
+main.txt
+*_console.txt
+transcript_*.md

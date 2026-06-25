@@ -24,13 +24,9 @@ from typing import Any, Dict, List
 
 import numpy as np
 
-from model_pipeline import Config, logger
-from main import (
-    build_dataset_and_loaders,
-    run_optuna_search,
-    train_and_test_setting,
-    FINAL_EVAL_SEEDS_POOL,
-)
+from arms import build_dataset_and_loaders, run_optuna_search, train_and_test_setting
+from experiments.final_eval import FINAL_EVAL_SEEDS_POOL
+from pipeline import Config, logger
 
 
 def _strip_for_json(setting: Dict[str, Any]) -> Dict[str, Any]:
