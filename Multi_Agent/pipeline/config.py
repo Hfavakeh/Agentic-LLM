@@ -85,6 +85,15 @@ class Config:
     # repair-on arm, which must be reported on its own.
     semantic_repair: bool = False
 
+    # `payload_curves` is the Q2 lever: when True, every tried setting's
+    # qualitative summary gains a per-epoch TRAINING CURVE shape label
+    # (still improving / overfitting upturn / unstable-noisy / clean plateau)
+    # derived from its validation trajectory, and the curve-aware rule-based
+    # controller diagnoses from that shape. Tests whether per-epoch curve
+    # information (vs best-epoch aggregates only) improves the LLM or the
+    # rule-based arm. Affects only the LLM and rule-based arms.
+    payload_curves: bool = False
+
     # `history_ablation` is the Q3 history-use placebo probe. It perturbs the
     # RENDERED history context the LLM proposer sees (NOT the engine's training)
     # to test whether the LLM actually uses history or mostly ignores it:

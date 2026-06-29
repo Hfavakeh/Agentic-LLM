@@ -227,6 +227,15 @@ def evaluate_setting(
             val_rmse = float(np.sqrt(min(finite_m))) if finite_m else float("inf")
         tr_at = float(clean_tr_loss) if is_finite_number(clean_tr_loss) else float("nan")
         vl_at = float(vl[idx]) if idx is not None and is_finite_number(vl[idx]) else float("nan")
+        # ── Per-epoch curve SHAPE features (Q2) ───────────────────────────────
+        # Computed from the metres validation curve (the early-stopping monitor,
+        # same metric as the score). These capture what the best-epoch scalars
+        # cannot: whether the curve was still descending at the budget limit,
+        # whether validation rose after its minimum (overfitting onset over
+        # epochs), and how noisy the trajectory was. Converted to a qualitative
+        # label only in the prompt; raw numbers stay here / in the logs.
+        curve = _curve_features([v for v in pos_m if is_finite_number(v)],
+                                epochs_trained=len(vl), max_epochs=max_epochs)
         per_seed.append({
             "seed":           int(seed),
             "val_rmse":       val_rmse,
@@ -236,6 +245,7 @@ def evaluate_setting(
             "val_loss":       vl_at,
             "train_val_gap":  (vl_at - tr_at) if (is_finite_number(vl_at) and is_finite_number(tr_at)) else float("nan"),
             "runtime_s":      runtime_s,
+            "curve":          curve,
         })
 
     def _mean(key: str) -> float:
@@ -253,10 +263,61 @@ def evaluate_setting(
         "mean_train_loss": _mean("train_loss"),
         "mean_val_loss":   _mean("val_loss"),
         "mean_train_val_gap": _mean("train_val_gap"),
+        "curve_summary":   _aggregate_curves([p.get("curve") for p in per_seed]),
         "runtime_s":       float(time.perf_counter() - t0),
         "n_trainings":     len(per_seed),
         "setting":         setting,
         "per_seed":        per_seed,
+    }
+
+
+def _curve_features(vc: List[float], epochs_trained: int, max_epochs: int) -> Optional[Dict[str, float]]:
+    """Per-epoch shape features of one seed's metres validation curve.
+
+    `vc` is the finite val-position-RMSE-in-metres trajectory over epochs.
+    Returns None when the curve is too short to read a shape from.
+      upturn : (val_last - val_best)/val_best  — overfitting rise after the minimum
+      osc    : mean |Δ| between consecutive epochs / mean level (post-warmup) — noise
+      still  : 1.0 if the best epoch is at the very tail (still descending), else 0.0
+      hit_max: 1.0 if training reached the epoch budget (early stopping never fired)
+      best_frac: best epoch position as a fraction of epochs trained
+    """
+    n = len(vc)
+    if n < 4:
+        return None
+    bidx  = int(np.argmin(vc))
+    vbest = float(vc[bidx])
+    vlast = float(vc[-1])
+    upturn = (vlast - vbest) / vbest if vbest > 0 else 0.0
+    tail = vc[2:] if n > 4 else vc                       # drop the noisy warmup epochs
+    diffs = np.abs(np.diff(tail))
+    level = float(np.mean(tail)) if len(tail) else 0.0
+    osc = float(np.mean(diffs) / level) if level > 0 and len(diffs) else 0.0
+    return {
+        "upturn":    float(upturn),
+        "osc":       osc,
+        "still":     1.0 if bidx >= n - 2 else 0.0,
+        "hit_max":   1.0 if epochs_trained >= max_epochs else 0.0,
+        "best_frac": (bidx + 1) / n,
+    }
+
+
+def _aggregate_curves(curves: List[Optional[Dict[str, float]]]) -> Dict[str, float]:
+    """Average the per-seed curve features into the run-level summary the
+    qualitative `_qual_curve_shape` label reads."""
+    valid = [c for c in curves if isinstance(c, dict)]
+    if not valid:
+        return {}
+    def _m(k: str) -> float:
+        vals = [c[k] for c in valid if is_finite_number(c.get(k))]
+        return float(np.mean(vals)) if vals else float("nan")
+    return {
+        "mean_upturn":          _m("upturn"),
+        "mean_oscillation":     _m("osc"),
+        "frac_still_improving": _m("still"),
+        "frac_hit_max":         _m("hit_max"),
+        "mean_best_frac":       _m("best_frac"),
+        "n_curves":             len(valid),
     }
 
 

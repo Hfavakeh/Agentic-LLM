@@ -44,6 +44,7 @@ async def run_experiment(
         enable_motion=getattr(config, "enable_motion", True),
         semantic_repair=getattr(config, "semantic_repair", False),
         history_ablation=getattr(config, "history_ablation", "none"),
+        payload_curves=getattr(config, "payload_curves", False),
     )
     logger.info("--- Run %d | LLM CONTROLLER (model=%s, attempts=%d × %d trainings) ---",
                 run_id, llm_model, l_cfg.optimization_rounds, len(TRAIN_SEEDS))
@@ -136,7 +137,10 @@ async def run_experiment(
         logger.info("--- Run %d | RULE-BASED = C2 (motion-aware) (attempts=%d × %d) ---",
                     run_id, rb_cfg.optimization_rounds, len(TRAIN_SEEDS))
     else:
-        rb_agent = RuleBasedOptimizer(allow_arch_changes=config.allow_arch_changes)
+        rb_agent = RuleBasedOptimizer(
+            allow_arch_changes=config.allow_arch_changes,
+            payload_curves=getattr(config, "payload_curves", False),
+        )
         logger.info("--- Run %d | RULE-BASED (attempts=%d × %d trainings) ---",
                     run_id, rb_cfg.optimization_rounds, len(TRAIN_SEEDS))
 

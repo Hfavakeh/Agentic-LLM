@@ -13,7 +13,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pipeline import HP_BOUNDS, is_finite_number, logger
 
-from .labels import _behavior_label, _qual_gap, _qual_quality, _qual_variation
+from .labels import (
+    CURVE_SHAPE_TO_DIAGNOSIS, _behavior_label, _qual_curve_shape,
+    _qual_gap, _qual_quality, _qual_variation,
+)
 from .validation import _grid_neighbor
 
 # ---------------------------------------------------------------------------
@@ -140,10 +143,15 @@ class RuleBasedOptimizer:
     # (e.g. MotionAwareRuleBasedOptimizer) override this.
     _MODE = "rule_based"
 
-    def __init__(self, allow_arch_changes: bool = False):
+    def __init__(self, allow_arch_changes: bool = False, payload_curves: bool = False):
         self.allow_arch_changes = allow_arch_changes
+        # Q2: when True the diagnosis is taken from the per-epoch curve SHAPE
+        # (the same signal the LLM is shown) when that shape is decisive,
+        # falling back to the aggregate behavior label otherwise.
+        self.payload_curves = payload_curves
         self.conversation_log: List[Dict[str, Any]] = []
-        logger.info("RuleBasedOptimizer initialised  allow_arch_changes=%s", allow_arch_changes)
+        logger.info("RuleBasedOptimizer initialised  allow_arch_changes=%s  payload_curves=%s",
+                    allow_arch_changes, payload_curves)
 
     # ------------------------------------------------------------------
     # Public interface (mirrors SingleAgentOptimizer)
@@ -207,6 +215,14 @@ class RuleBasedOptimizer:
         last = history[-1]
         if not last.get("trained", True):
             return "inconclusive"
+        # Q2: prefer the per-epoch curve shape when enabled and decisive. This is
+        # the only thing that changes vs the curves-off controller, so any
+        # difference in results is attributable to the curve information.
+        if self.payload_curves:
+            shape = _qual_curve_shape(last.get("curve_summary"))
+            mapped = CURVE_SHAPE_TO_DIAGNOSIS.get(shape)
+            if mapped is not None:
+                return mapped
         all_scores = [h.get("score") for h in history]
         var = _qual_variation(last.get("score"), last.get("val_rmse_std"))
         gap = _qual_gap(last.get("mean_val_loss"), last.get("mean_train_val_gap"))

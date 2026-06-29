@@ -12,8 +12,8 @@ from typing import Any, Dict, List
 from pipeline import HP_GRID, is_finite_number
 
 from .labels import (
-    _behavior_label, _fmt_grid_val, _qual_epoch_timing, _qual_gap,
-    _qual_level_10, _qual_quality, _qual_variation,
+    _behavior_label, _fmt_grid_val, _qual_curve_shape, _qual_epoch_timing,
+    _qual_gap, _qual_level_10, _qual_quality, _qual_variation,
 )
 
 _HP_ORDER = [
@@ -31,7 +31,7 @@ def _format_search_space_text(allow_arch_changes: bool = True) -> str:
     return "\n".join(lines)
 
 
-def protocol_system_prompt(allow_arch_changes: bool = True) -> str:
+def protocol_system_prompt(allow_arch_changes: bool = True, show_curves: bool = False) -> str:
     """The from-scratch protocol prompt: tune conventional HPs from the
     qualitative history of tried settings, proposing a small delta vs the
     best-so-far anchor. No motion levers, no Pareto cost weights."""
@@ -39,12 +39,25 @@ def protocol_system_prompt(allow_arch_changes: bool = True) -> str:
         "" if allow_arch_changes
         else "\n(NOTE: lstm_hidden and lstm_layers are FIXED this run — do not propose them.)"
     )
+    curve_note = (
+        "\n\nEach setting also reports a TRAINING CURVE shape describing how its "
+        "validation error moved over epochs:\n"
+        "  - still improving: error was still dropping when training stopped "
+        "(more capacity / a higher learning rate may help)\n"
+        "  - overfitting upturn: error rose again after reaching its best "
+        "(add regularization)\n"
+        "  - unstable/noisy: error oscillated epoch-to-epoch (lower the learning "
+        "rate or raise batch size)\n"
+        "  - clean plateau: error converged and flattened\n"
+        "Use the curve shape, not only the final score, to choose the change."
+        if show_curves else ""
+    )
     return f"""You are tuning an LSTM model for indoor localization of one person. The model receives windows of sensor features and predicts position. Your goal is to reduce validation error while avoiding unstable behavior. Do not repeat a setting that has already been tried.
 
 You may change ONLY these hyperparameters, and ONLY to one of the listed allowed values:
 {_format_search_space_text(allow_arch_changes)}{arch_note}
 
-Each setting is trained 3 times (3 fixed seeds) and scored by its MEAN validation RMSE - lower is better. You are shown the best settings so far, the most recent attempts, every setting already tried, and observed patterns, all as qualitative summaries.
+Each setting is trained 3 times (3 fixed seeds) and scored by its MEAN validation RMSE - lower is better. You are shown the best settings so far, the most recent attempts, every setting already tried, and observed patterns, all as qualitative summaries.{curve_note}
 
 Propose a SMALL change relative to the best setting so far (shown as ANCHOR). Respond using EXACTLY these lines, one field per line, no prose, no markdown:
 
@@ -69,6 +82,7 @@ def format_protocol_payload(
     anchor_setting: Dict[str, Any],
     max_epochs: int,
     allow_arch_changes: bool = True,
+    show_curves: bool = False,
 ) -> str:
     """Render the qualitative history context the protocol prompt consumes.
 
@@ -96,13 +110,18 @@ def format_protocol_payload(
         gap = _qual_gap(h.get("mean_val_loss"), h.get("mean_train_val_gap"))
         tim = _qual_epoch_timing(h.get("mean_best_epoch"), max_epochs)
         beh = _behavior_label(var, gap, q)
-        return [
+        lines = [
             f"    validation quality: {q} (level {_level_str(h)}, 1=best 10=worst)",
             f"    reliability across 3 trainings: {var}",
             f"    train/validation gap: {gap}",
             f"    best epoch timing: {tim}",
             f"    behavior label: {beh.replace('_', ' ')}",
         ]
+        if show_curves:
+            shape = _qual_curve_shape(h.get("curve_summary"))
+            if shape != "unknown":
+                lines.append(f"    training curve: {shape.replace('_', ' ')}")
+        return lines
 
     # ── Best settings so far (top 5, RANKED best → worst) ─────────────────────
     ranked = sorted(
@@ -143,6 +162,10 @@ def format_protocol_payload(
                          f"  gap: {_qual_gap(h.get('mean_val_loss'), h.get('mean_train_val_gap'))}"
                          f"  best epoch: {_qual_epoch_timing(h.get('mean_best_epoch'), max_epochs)}")
             lines.append(f"    behavior label: {beh.replace('_', ' ')}")
+            if show_curves:
+                shape = _qual_curve_shape(h.get("curve_summary"))
+                if shape != "unknown":
+                    lines.append(f"    training curve: {shape.replace('_', ' ')}")
             lines.append(f"    output: {h.get('output_status', 'clean')}")
             if is_finite_number(h.get("score")):
                 prev_score = h["score"]

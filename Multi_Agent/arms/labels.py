@@ -100,6 +100,54 @@ def _qual_level_10(score: Any, all_scores: List[float]) -> Optional[int]:
     return int(round(1 + frac * 9))                  # 1..10
 
 
+# Per-epoch curve-shape thresholds (Q2). These capture what the best-epoch
+# AGGREGATES cannot: how the validation curve *moved* over epochs.
+_CURVE_UPTURN_RATIO = 0.10   # (val_last - val_best)/val_best above this = overfitting upturn
+_CURVE_OSC_RATIO    = 0.30   # mean |Δ|/level above this = noisy / unstable curve
+_CURVE_STILL_FRAC   = 0.50   # fraction of seeds still descending at the budget limit
+
+
+def _qual_curve_shape(curve_summary: Any) -> str:
+    """Map an aggregated per-epoch curve summary to one qualitative shape label.
+
+    Returns one of:
+      still_improving  — training hit the epoch budget with the best epoch at the
+                         very tail (the curve was still descending when stopped):
+                         more capacity / epochs / a higher LR would likely help.
+      overfitting_upturn — validation rose noticeably AFTER its minimum: regularise.
+      unstable_noisy   — the curve oscillates epoch-to-epoch: stabilise.
+      clean_plateau    — converged and flattened with no upturn: a genuine plateau.
+    'unknown' when no curve summary is available. Order matters: instability and
+    overfitting upturns are flagged before the gentler still-improving / plateau
+    readings.
+    """
+    if not isinstance(curve_summary, dict) or not curve_summary:
+        return "unknown"
+    osc   = curve_summary.get("mean_oscillation")
+    up    = curve_summary.get("mean_upturn")
+    still = curve_summary.get("frac_still_improving")
+    hitmx = curve_summary.get("frac_hit_max")
+    if is_finite_number(osc) and float(osc) > _CURVE_OSC_RATIO:
+        return "unstable_noisy"
+    if is_finite_number(up) and float(up) > _CURVE_UPTURN_RATIO:
+        return "overfitting_upturn"
+    if (is_finite_number(still) and is_finite_number(hitmx)
+            and float(still) >= _CURVE_STILL_FRAC and float(hitmx) >= _CURVE_STILL_FRAC):
+        return "still_improving"
+    return "clean_plateau"
+
+
+# How a curve shape maps onto the soft diagnosis set, for the curve-aware
+# rule-based controller (Q2). 'clean_plateau' is intentionally absent — it adds
+# no diagnosis beyond the aggregate behavior label, so the controller falls back
+# to `_behavior_label` there.
+CURVE_SHAPE_TO_DIAGNOSIS = {
+    "still_improving":    "possible_underfitting_tendency",
+    "overfitting_upturn": "possible_overfitting_tendency",
+    "unstable_noisy":     "unstable",
+}
+
+
 def _behavior_label(variation: str, gap: str, quality: str) -> str:
     """Soft behavior label from the qualitative signals (email's label set)."""
     if variation == "high":

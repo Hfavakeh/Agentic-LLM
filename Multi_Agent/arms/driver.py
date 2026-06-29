@@ -98,6 +98,7 @@ async def run_proposer_search(
             "mean_train_loss": result["mean_train_loss"],
             "mean_val_loss": result["mean_val_loss"],
             "mean_train_val_gap": result["mean_train_val_gap"],
+            "curve_summary": result.get("curve_summary", {}),
             "runtime_s": result["runtime_s"],
             "changes_from_anchor": proposal.get("proposed_changes", {}) or {},
             "diagnosis": proposal.get("diagnosis"), "strategy": proposal.get("strategy"),

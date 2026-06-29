@@ -237,7 +237,8 @@ w_res: <0.0 to 1.0>
     def __init__(self, model_name: str = "minimax-m2.5:cloud", max_retries: int = 1,
                  model_arch: str = "LSTM", allow_arch_changes: bool = True,
                  enable_motion: bool = True, semantic_repair: bool = False,
-                 llm_timeout_s: float = 300.0, history_ablation: str = "none"):
+                 llm_timeout_s: float = 300.0, history_ablation: str = "none",
+                 payload_curves: bool = False):
 
         self.client = OllamaChatCompletionClient(
             model=model_name,
@@ -277,6 +278,10 @@ w_res: <0.0 to 1.0>
         self.history_ablation  = history_ablation
         self._ablation_rng     = random.Random(12345)
         self.protocol_log: List[Dict[str, Any]] = []
+
+        # Q2: when True, the rendered history adds a per-epoch TRAINING CURVE
+        # shape label per setting and the system prompt explains how to use it.
+        self.payload_curves    = payload_curves
 
         self.retry_stats: Dict[str, int] = {
             # Per-attempt counters
@@ -385,7 +390,7 @@ w_res: <0.0 to 1.0>
                   "repeats_proposed", "invalid_values"):
             self.retry_stats.setdefault(k, 0)
         if not hasattr(self, "_protocol_prompt"):
-            self._protocol_prompt = protocol_system_prompt(self.allow_arch_changes)
+            self._protocol_prompt = protocol_system_prompt(self.allow_arch_changes, self.payload_curves)
 
         anchor      = context.get("anchor_setting") or {}
         is_tried    = context.get("is_tried") or (lambda s: False)
@@ -399,7 +404,8 @@ w_res: <0.0 to 1.0>
         rendered_history = _apply_history_ablation(
             history, self.history_ablation, self._ablation_rng,
         )
-        base_user = format_protocol_payload(rendered_history, anchor, max_epochs, allow_arch)
+        base_user = format_protocol_payload(rendered_history, anchor, max_epochs, allow_arch,
+                                            show_curves=self.payload_curves)
         feedback = ""
         last_reason = "unknown"
         last_parsed: Dict[str, Any] = {}

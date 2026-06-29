@@ -118,6 +118,18 @@ def parse_args():
     )
 
     p.add_argument(
+        "--payload-curves", action="store_true", dest="payload_curves",
+        help=(
+            "Q2: add a per-epoch TRAINING CURVE shape label (still improving / "
+            "overfitting upturn / unstable-noisy / clean plateau) to each tried "
+            "setting's qualitative summary, and let the rule-based controller "
+            "diagnose from that shape. Tests whether per-epoch curve information "
+            "(vs best-epoch aggregates only) improves the LLM or rule-based arm. "
+            "Run with and without this flag, same --model / --seeds, to A/B."
+        ),
+    )
+
+    p.add_argument(
         "--history-ablation", default="none", dest="history_ablation",
         choices=["none", "shuffled", "empty"],
         help=(
@@ -171,6 +183,15 @@ def build_config(args) -> Config:
         logger.info(
             "Semantic repair OFF (protocol main run): invalid LLM output is "
             "rejected, retried once, then the round trains with no HP change."
+        )
+
+    # Q2: per-epoch training-curve summaries in the payload + curve-aware
+    # rule-based diagnosis.
+    cfg.payload_curves = bool(getattr(args, "payload_curves", False))
+    if cfg.payload_curves:
+        logger.info(
+            "Payload curves ENABLED (Q2): per-epoch training-curve shape labels "
+            "added to the LLM payload and the rule-based diagnosis."
         )
 
     # Q3 history-use placebo (LLM arm). Default "none" = normal run.
