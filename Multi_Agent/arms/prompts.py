@@ -31,10 +31,16 @@ def _format_search_space_text(allow_arch_changes: bool = True) -> str:
     return "\n".join(lines)
 
 
-def protocol_system_prompt(allow_arch_changes: bool = True, show_curves: bool = False) -> str:
+def protocol_system_prompt(allow_arch_changes: bool = True, show_curves: bool = False,
+                           explore: bool = False) -> str:
     """The from-scratch protocol prompt: tune conventional HPs from the
     qualitative history of tried settings, proposing a small delta vs the
-    best-so-far anchor. No motion levers, no Pareto cost weights."""
+    best-so-far anchor. No motion levers, no Pareto cost weights.
+
+    `explore=True` (Q4 prompt-variant) swaps the "propose a SMALL change vs the
+    ANCHOR" instruction for an exploration-oriented one (change several HPs, make
+    large moves into untried regions). Used to test whether the anchoring
+    instruction is what caps the LLM's search-grid coverage."""
     arch_note = (
         "" if allow_arch_changes
         else "\n(NOTE: lstm_hidden and lstm_layers are FIXED this run — do not propose them.)"
@@ -59,7 +65,7 @@ You may change ONLY these hyperparameters, and ONLY to one of the listed allowed
 
 Each setting is trained 3 times (3 fixed seeds) and scored by its MEAN validation RMSE - lower is better. You are shown the best settings so far, the most recent attempts, every setting already tried, and observed patterns, all as qualitative summaries.{curve_note}
 
-Propose a SMALL change relative to the best setting so far (shown as ANCHOR). Respond using EXACTLY these lines, one field per line, no prose, no markdown:
+{_proposal_instruction(explore)}
 
 diagnosis: <healthy | possible overfitting tendency | possible underfitting tendency | plateau | unstable | inconclusive>
 strategy: <one short phrase, e.g. increase regularization>
@@ -67,6 +73,24 @@ changes: <param=value, param=value>
 reason: <one sentence>
 confidence: <low | medium | high>
 """
+
+
+def _proposal_instruction(explore: bool) -> str:
+    """The strategic instruction line(s) before the output format. The Q4
+    prompt-variant (`explore=True`) replaces the small-delta-vs-anchor framing
+    with an exploration-oriented one."""
+    if explore:
+        return (
+            "EXPLORE the search space: propose a setting in a region you have NOT tried yet. "
+            "You may change SEVERAL hyperparameters at once and make LARGE moves away from the best "
+            "setting so far (shown as ANCHOR) — do not just tweak one value. Prefer allowed values and "
+            "combinations that are not in the already-tried list, so each attempt covers new ground. "
+            "Respond using EXACTLY these lines, one field per line, no prose, no markdown:"
+        )
+    return (
+        "Propose a SMALL change relative to the best setting so far (shown as ANCHOR). "
+        "Respond using EXACTLY these lines, one field per line, no prose, no markdown:"
+    )
 
 
 def _setting_line(setting: Dict[str, Any], allow_arch_changes: bool = True) -> str:

@@ -118,6 +118,18 @@ def parse_args():
     )
 
     p.add_argument(
+        "--explore-prompt", action="store_true", dest="explore_prompt",
+        help=(
+            "Q4 prompt-variant (LLM arm only): replace the 'propose a SMALL "
+            "change vs the ANCHOR' instruction with one that asks the LLM to "
+            "explore untried regions (change several HPs, make large moves). "
+            "Tests whether the anchoring instruction is what caps the LLM's "
+            "search-grid coverage. A/B against the default-prompt run on the "
+            "same --model / --seeds."
+        ),
+    )
+
+    p.add_argument(
         "--payload-curves", action="store_true", dest="payload_curves",
         help=(
             "Q2: add a per-epoch TRAINING CURVE shape label (still improving / "
@@ -183,6 +195,14 @@ def build_config(args) -> Config:
         logger.info(
             "Semantic repair OFF (protocol main run): invalid LLM output is "
             "rejected, retried once, then the round trains with no HP change."
+        )
+
+    # Q4 prompt-variant: exploration-oriented system prompt (LLM arm).
+    cfg.explore_prompt = bool(getattr(args, "explore_prompt", False))
+    if cfg.explore_prompt:
+        logger.info(
+            "Explore prompt ENABLED (Q4 variant): the LLM is asked to explore "
+            "untried regions instead of a small change vs the anchor."
         )
 
     # Q2: per-epoch training-curve summaries in the payload + curve-aware

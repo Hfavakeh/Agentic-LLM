@@ -94,6 +94,13 @@ class Config:
     # rule-based arm. Affects only the LLM and rule-based arms.
     payload_curves: bool = False
 
+    # `explore_prompt` is the Q4 prompt-variant lever (LLM arm only): when True,
+    # the system prompt drops the "propose a SMALL change vs the ANCHOR"
+    # instruction in favour of broad exploration of untried regions. Tests
+    # whether the anchoring instruction is what caps the LLM's search-grid
+    # coverage (vs random/Optuna ~100%).
+    explore_prompt: bool = False
+
     # `history_ablation` is the Q3 history-use placebo probe. It perturbs the
     # RENDERED history context the LLM proposer sees (NOT the engine's training)
     # to test whether the LLM actually uses history or mostly ignores it:

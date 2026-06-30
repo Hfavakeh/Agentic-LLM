@@ -45,6 +45,7 @@ async def run_experiment(
         semantic_repair=getattr(config, "semantic_repair", False),
         history_ablation=getattr(config, "history_ablation", "none"),
         payload_curves=getattr(config, "payload_curves", False),
+        explore_prompt=getattr(config, "explore_prompt", False),
     )
     logger.info("--- Run %d | LLM CONTROLLER (model=%s, attempts=%d × %d trainings) ---",
                 run_id, llm_model, l_cfg.optimization_rounds, len(TRAIN_SEEDS))
