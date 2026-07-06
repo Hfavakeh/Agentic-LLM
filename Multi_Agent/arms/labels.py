@@ -148,6 +148,49 @@ CURVE_SHAPE_TO_DIAGNOSIS = {
 }
 
 
+# ── Motion-aware labels (Q5) ────────────────────────────────────────────────
+# Absolute pace thresholds for indoor human movement (m/s, on the median speed).
+_PACE_SLOW_MAX = 0.40
+_PACE_BRISK_MIN = 0.90
+_ERR_SPREAD_MIN = 1.30   # worst/best regime error ratio above this = concentrated
+
+
+def _qual_motion_profile(profile: Any) -> Optional[str]:
+    """One qualitative sentence about the dataset's motion regime, from the
+    motion profile (speed distribution + dwell). Raw numbers stay in the logs."""
+    if not isinstance(profile, dict) or not profile:
+        return None
+    med = profile.get("speed_median_mps")
+    p95 = profile.get("speed_p95_mps")
+    dwell = profile.get("dwell") or {}
+    stop_share = dwell.get("stop_share")
+    if not is_finite_number(med):
+        return None
+    pace = ("mostly slow" if float(med) < _PACE_SLOW_MAX
+            else "brisk" if float(med) > _PACE_BRISK_MIN else "moderate-paced")
+    parts = [pace + " movement"]
+    if is_finite_number(p95) and is_finite_number(med) and float(med) > 0 and float(p95) > 2.0 * float(med):
+        parts.append("with occasional fast bursts")
+    if is_finite_number(stop_share):
+        parts.append("frequent stop-go" if float(stop_share) > 0.15
+                     else "rare stops" if float(stop_share) < 0.05 else "some stop-go")
+    return ", ".join(parts)
+
+
+def _qual_motion_error(regime_err: Any) -> Optional[str]:
+    """Qualitative label for where the model's error concentrates across motion
+    regimes (slow / medium / fast), from `per_regime_error`."""
+    if not isinstance(regime_err, dict) or not regime_err:
+        return None
+    worst = regime_err.get("worst_regime")
+    spread = regime_err.get("spread_ratio")
+    if not worst:
+        return None
+    if is_finite_number(spread) and float(spread) >= _ERR_SPREAD_MIN:
+        return f"error concentrated in the {worst} regime"
+    return "error roughly uniform across regimes"
+
+
 def _behavior_label(variation: str, gap: str, quality: str) -> str:
     """Soft behavior label from the qualitative signals (email's label set)."""
     if variation == "high":
