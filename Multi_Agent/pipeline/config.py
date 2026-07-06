@@ -94,12 +94,32 @@ class Config:
     # rule-based arm. Affects only the LLM and rule-based arms.
     payload_curves: bool = False
 
+    # `payload_motion` is the Q5 lever: when True, the LLM payload gains a
+    # qualitative MOTION PROFILE of the tracked person (pace, fast bursts,
+    # stop-go) plus, per setting, where its position error concentrates across
+    # motion regimes (slow / medium / fast). The engine computes the per-regime
+    # validation error only when this is on. Search space unchanged (9 HPs);
+    # tests whether motion-aware summaries change the LLM's decisions and the
+    # per-regime error. Bridge to the main human-motion thesis direction.
+    payload_motion: bool = False
+
     # `explore_prompt` is the Q4 prompt-variant lever (LLM arm only): when True,
     # the system prompt drops the "propose a SMALL change vs the ANCHOR"
     # instruction in favour of broad exploration of untried regions. Tests
     # whether the anchoring instruction is what caps the LLM's search-grid
     # coverage (vs random/Optuna ~100%).
     explore_prompt: bool = False
+
+    # `opro_prompt` is the OPRO-style prompt-variant lever (LLM arm only), added
+    # for the Email-5 diagnostic. When True the LLM arm abandons the qualitative
+    # label payload + small-delta-vs-anchor framing and instead follows the OPRO
+    # meta-prompt recipe (Yang et al., 2024): the history is rendered as explicit
+    # (setting, NUMERIC score) pairs sorted worst→best, and the LLM is asked to
+    # emit a COMPLETE new setting expected to score lower than all of them. Tests
+    # whether the SoTA optimizer-prompting style (raw candidates + scores) beats
+    # the protocol's qualitative-label prompt. Mutually exclusive with
+    # `explore_prompt`; only affects the LLM arm.
+    opro_prompt: bool = False
 
     # `history_ablation` is the Q3 history-use placebo probe. It perturbs the
     # RENDERED history context the LLM proposer sees (NOT the engine's training)

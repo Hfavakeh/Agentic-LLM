@@ -118,6 +118,18 @@ def parse_args():
     )
 
     p.add_argument(
+        "--payload-motion", action="store_true", dest="payload_motion",
+        help=(
+            "Q5: add a qualitative MOTION PROFILE (pace, fast bursts, stop-go) "
+            "and per-setting per-regime (slow/med/fast) validation-error labels "
+            "to the LLM payload; the engine computes the per-regime error only "
+            "when this is on. Search space unchanged. Tests whether motion-aware "
+            "summaries change the LLM's decisions / per-regime errors. A/B "
+            "against the no-motion run on the same --model / --seeds."
+        ),
+    )
+
+    p.add_argument(
         "--explore-prompt", action="store_true", dest="explore_prompt",
         help=(
             "Q4 prompt-variant (LLM arm only): replace the 'propose a SMALL "
@@ -126,6 +138,21 @@ def parse_args():
             "Tests whether the anchoring instruction is what caps the LLM's "
             "search-grid coverage. A/B against the default-prompt run on the "
             "same --model / --seeds."
+        ),
+    )
+
+    p.add_argument(
+        "--opro-prompt", action="store_true", dest="opro_prompt",
+        help=(
+            "OPRO prompt-variant (LLM arm only; Email-5 diagnostic): replace the "
+            "qualitative-label payload + small-delta-vs-anchor framing with the "
+            "OPRO recipe (Yang et al., 2024) — show past (setting, NUMERIC score) "
+            "pairs sorted worst→best and ask the LLM for a COMPLETE new setting "
+            "expected to score lower than all of them. Tests whether SoTA "
+            "optimizer-prompting (raw candidates + scores) beats the protocol's "
+            "label prompt. Overrides --explore-prompt/--payload-curves/"
+            "--payload-motion for the LLM arm. A/B against the default-prompt run "
+            "on the same --model / --seeds."
         ),
     )
 
@@ -197,6 +224,15 @@ def build_config(args) -> Config:
             "rejected, retried once, then the round trains with no HP change."
         )
 
+    # Q5: motion-aware summaries (motion profile + per-regime error) in the
+    # LLM payload.
+    cfg.payload_motion = bool(getattr(args, "payload_motion", False))
+    if cfg.payload_motion:
+        logger.info(
+            "Payload motion ENABLED (Q5): motion profile + per-regime error "
+            "labels added to the LLM payload; engine computes per-regime val error."
+        )
+
     # Q4 prompt-variant: exploration-oriented system prompt (LLM arm).
     cfg.explore_prompt = bool(getattr(args, "explore_prompt", False))
     if cfg.explore_prompt:
@@ -204,6 +240,18 @@ def build_config(args) -> Config:
             "Explore prompt ENABLED (Q4 variant): the LLM is asked to explore "
             "untried regions instead of a small change vs the anchor."
         )
+
+    # OPRO prompt-variant (Email-5): raw (setting, score) trajectory + ask for a
+    # full new candidate. Overrides explore_prompt for the LLM arm.
+    cfg.opro_prompt = bool(getattr(args, "opro_prompt", False))
+    if cfg.opro_prompt:
+        logger.info(
+            "OPRO prompt ENABLED (Email-5 variant): the LLM sees past settings "
+            "with their NUMERIC scores (sorted worst→best) and proposes a "
+            "complete new setting expected to score lower."
+        )
+        if cfg.explore_prompt:
+            logger.warning("--opro-prompt overrides --explore-prompt for the LLM arm.")
 
     # Q2: per-epoch training-curve summaries in the payload + curve-aware
     # rule-based diagnosis.

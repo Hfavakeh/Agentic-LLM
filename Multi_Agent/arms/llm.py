@@ -25,7 +25,10 @@ from pipeline import logger, sanitize_for_json
 
 from .legacy import SemanticRepairRequired, _format_history, _format_payload_as_text, _validate_proposal
 from .parsing import _parse_llm_proposal, _parse_protocol_proposal
-from .prompts import format_protocol_payload, protocol_system_prompt
+from .prompts import (
+    format_opro_payload, format_protocol_payload, opro_system_prompt,
+    protocol_system_prompt,
+)
 from .validation import _human_reason, validate_protocol_changes
 
 
@@ -238,7 +241,8 @@ w_res: <0.0 to 1.0>
                  model_arch: str = "LSTM", allow_arch_changes: bool = True,
                  enable_motion: bool = True, semantic_repair: bool = False,
                  llm_timeout_s: float = 300.0, history_ablation: str = "none",
-                 payload_curves: bool = False, explore_prompt: bool = False):
+                 payload_curves: bool = False, explore_prompt: bool = False,
+                 payload_motion: bool = False, opro_prompt: bool = False):
 
         self.client = OllamaChatCompletionClient(
             model=model_name,
@@ -285,6 +289,19 @@ w_res: <0.0 to 1.0>
         # Q4 prompt-variant: when True, the system prompt instructs broad
         # exploration of untried regions instead of a small change vs the anchor.
         self.explore_prompt    = explore_prompt
+        # Q5: when True, the payload gains a MOTION PROFILE block and a per-setting
+        # per-regime (slow/med/fast) error label, and the prompt explains them.
+        self.payload_motion    = payload_motion
+        # OPRO variant (Email-5): when True the LLM arm uses the OPRO meta-prompt
+        # + raw (setting, score) trajectory payload instead of the qualitative
+        # protocol prompt. Takes precedence over explore_prompt/payload_curves/
+        # payload_motion (those shape the qualitative payload, unused by OPRO).
+        self.opro_prompt       = opro_prompt
+        if opro_prompt and (explore_prompt or payload_curves or payload_motion):
+            logger.warning(
+                "opro_prompt=True overrides explore_prompt/payload_curves/"
+                "payload_motion for the LLM arm (OPRO uses its own prompt+payload)."
+            )
 
         self.retry_stats: Dict[str, int] = {
             # Per-attempt counters
@@ -393,14 +410,20 @@ w_res: <0.0 to 1.0>
                   "repeats_proposed", "invalid_values"):
             self.retry_stats.setdefault(k, 0)
         if not hasattr(self, "_protocol_prompt"):
-            self._protocol_prompt = protocol_system_prompt(
-                self.allow_arch_changes, self.payload_curves, self.explore_prompt)
+            self._protocol_prompt = (
+                opro_system_prompt(self.allow_arch_changes)
+                if self.opro_prompt else
+                protocol_system_prompt(
+                    self.allow_arch_changes, self.payload_curves,
+                    self.explore_prompt, self.payload_motion)
+            )
 
         anchor      = context.get("anchor_setting") or {}
         is_tried    = context.get("is_tried") or (lambda s: False)
         allow_arch  = context.get("allow_arch_changes", self.allow_arch_changes)
         max_epochs  = int(context.get("max_epochs", 100))
         history     = context.get("history", [])
+        motion_profile = context.get("motion_profile", {})
 
         # Q3 placebo: perturb the RENDERED history (not the true anchor / engine
         # training) so we can test whether the LLM's proposals actually depend
@@ -408,8 +431,13 @@ w_res: <0.0 to 1.0>
         rendered_history = _apply_history_ablation(
             history, self.history_ablation, self._ablation_rng,
         )
-        base_user = format_protocol_payload(rendered_history, anchor, max_epochs, allow_arch,
-                                            show_curves=self.payload_curves)
+        if self.opro_prompt:
+            base_user = format_opro_payload(rendered_history, anchor, allow_arch)
+        else:
+            base_user = format_protocol_payload(rendered_history, anchor, max_epochs, allow_arch,
+                                                show_curves=self.payload_curves,
+                                                motion_profile=motion_profile,
+                                                show_motion=self.payload_motion)
         feedback = ""
         last_reason = "unknown"
         last_parsed: Dict[str, Any] = {}
@@ -421,6 +449,7 @@ w_res: <0.0 to 1.0>
             "timestamp":        datetime.now().isoformat(),
             "attempt_index":    len(self.protocol_log) + 1,
             "history_ablation": self.history_ablation,
+            "opro_prompt":      self.opro_prompt,
             "anchor":           dict(anchor),
             "n_history":        len(history),
             "history_snapshot": [

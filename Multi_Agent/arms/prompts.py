@@ -13,7 +13,8 @@ from pipeline import HP_GRID, is_finite_number
 
 from .labels import (
     _behavior_label, _fmt_grid_val, _qual_curve_shape, _qual_epoch_timing,
-    _qual_gap, _qual_level_10, _qual_quality, _qual_variation,
+    _qual_gap, _qual_level_10, _qual_motion_error, _qual_motion_profile,
+    _qual_quality, _qual_variation,
 )
 
 _HP_ORDER = [
@@ -32,7 +33,7 @@ def _format_search_space_text(allow_arch_changes: bool = True) -> str:
 
 
 def protocol_system_prompt(allow_arch_changes: bool = True, show_curves: bool = False,
-                           explore: bool = False) -> str:
+                           explore: bool = False, show_motion: bool = False) -> str:
     """The from-scratch protocol prompt: tune conventional HPs from the
     qualitative history of tried settings, proposing a small delta vs the
     best-so-far anchor. No motion levers, no Pareto cost weights.
@@ -58,12 +59,21 @@ def protocol_system_prompt(allow_arch_changes: bool = True, show_curves: bool = 
         "Use the curve shape, not only the final score, to choose the change."
         if show_curves else ""
     )
+    motion_note = (
+        "\n\nYou are also shown a MOTION PROFILE of how the tracked person moves "
+        "(overall pace, fast bursts, stop-go), and for each setting where its "
+        "position error concentrates across motion regimes (slow / medium / fast). "
+        "Use your knowledge of how people move: if error concentrates in the fast "
+        "regime the model may underfit quick movements (more capacity / longer "
+        "window), and a smoother / slower regime tolerates more regularization."
+        if show_motion else ""
+    )
     return f"""You are tuning an LSTM model for indoor localization of one person. The model receives windows of sensor features and predicts position. Your goal is to reduce validation error while avoiding unstable behavior. Do not repeat a setting that has already been tried.
 
 You may change ONLY these hyperparameters, and ONLY to one of the listed allowed values:
 {_format_search_space_text(allow_arch_changes)}{arch_note}
 
-Each setting is trained 3 times (3 fixed seeds) and scored by its MEAN validation RMSE - lower is better. You are shown the best settings so far, the most recent attempts, every setting already tried, and observed patterns, all as qualitative summaries.{curve_note}
+Each setting is trained 3 times (3 fixed seeds) and scored by its MEAN validation RMSE - lower is better. You are shown the best settings so far, the most recent attempts, every setting already tried, and observed patterns, all as qualitative summaries.{curve_note}{motion_note}
 
 {_proposal_instruction(explore)}
 
@@ -93,6 +103,71 @@ def _proposal_instruction(explore: bool) -> str:
     )
 
 
+def opro_system_prompt(allow_arch_changes: bool = True) -> str:
+    """OPRO-style optimizer meta-prompt (Yang et al., 2024, "Large Language
+    Models as Optimizers"), added for the Email-5 diagnostic.
+
+    Unlike `protocol_system_prompt` (qualitative labels + small delta vs the
+    ANCHOR), this asks the LLM to read a list of past (setting, NUMERIC score)
+    pairs sorted worst→best and emit a COMPLETE new setting expected to score
+    lower than all of them. The reply still uses the protocol's 5-line format so
+    the existing parser/validator/logging apply unchanged — but `changes:` must
+    carry ALL hyperparameters (a full candidate), not a one-value tweak.
+    """
+    arch_note = (
+        "" if allow_arch_changes
+        else "\n(NOTE: lstm_hidden and lstm_layers are FIXED this run — reuse the listed value, do not vary them.)"
+    )
+    n_hp = len(_HP_ORDER) - (0 if allow_arch_changes else 2)
+    return f"""You are optimizing the hyperparameters of an LSTM model for indoor localization of one person. The model receives windows of sensor features and predicts position. Each setting is trained 3 times (3 fixed seeds) and scored by its MEAN validation RMSE — lower is better.
+
+You may use ONLY these hyperparameters, and ONLY the listed allowed values:
+{_format_search_space_text(allow_arch_changes)}{arch_note}
+
+Below (in the message) are hyperparameter settings that have already been evaluated, each with its measured score, sorted from HIGHEST (worst) to LOWEST (best) score. Study how the values relate to the scores, then propose ONE NEW complete setting that is DIFFERENT from every setting listed and that you expect to have a score LOWER than all of them.
+
+Give a COMPLETE setting: specify all {n_hp} hyperparameters in the `changes:` line (every allowed value must come from the lists above). Do not repeat any setting already listed.
+
+Respond using EXACTLY these lines, one field per line, no prose, no markdown:
+
+diagnosis: <healthy | possible overfitting tendency | possible underfitting tendency | plateau | unstable | inconclusive>
+strategy: <one short phrase, e.g. lower learning rate and add regularization>
+changes: <param=value, param=value, ... for ALL hyperparameters>
+reason: <one sentence>
+confidence: <low | medium | high>
+"""
+
+
+def format_opro_payload(
+    history: List[Dict[str, Any]],
+    anchor_setting: Dict[str, Any],
+    allow_arch_changes: bool = True,
+) -> str:
+    """Render the OPRO trajectory: past (setting, NUMERIC score) pairs sorted
+    worst→best (highest RMSE first), so the best solution sits closest to the
+    instruction — the ordering the OPRO meta-prompt relies on. Raw numeric
+    scores are shown on purpose (the point of the OPRO variant vs the
+    qualitative-label protocol payload)."""
+    scored = [h for h in history if is_finite_number(h.get("score"))]
+    # OPRO convention: ascending by quality so the best (lowest RMSE) is last.
+    ranked = sorted(scored, key=lambda h: float(h["score"]), reverse=True)
+
+    lines: List[str] = []
+    lines.append("== EVALUATED SETTINGS (score = mean validation RMSE, lower is better; sorted worst → best) ==")
+    if ranked:
+        for h in ranked:
+            lines.append(
+                f"  score={float(h['score']):.4f}  "
+                f"{_setting_line(h.get('setting', {}), allow_arch_changes)}"
+            )
+    else:
+        lines.append("  (none yet — propose a sensible starting setting)")
+    lines.append("")
+    lines.append("Propose ONE NEW complete setting, different from all above, with a lower score.")
+    lines.append("Respond ONLY in the protocol line format. One field per line. No prose, no markdown.")
+    return "\n".join(lines)
+
+
 def _setting_line(setting: Dict[str, Any], allow_arch_changes: bool = True) -> str:
     parts = []
     for k in _HP_ORDER:
@@ -107,6 +182,8 @@ def format_protocol_payload(
     max_epochs: int,
     allow_arch_changes: bool = True,
     show_curves: bool = False,
+    motion_profile: Any = None,
+    show_motion: bool = False,
 ) -> str:
     """Render the qualitative history context the protocol prompt consumes.
 
@@ -123,6 +200,14 @@ def format_protocol_payload(
     lines.append("== ANCHOR (best setting so far - propose changes relative to this) ==")
     lines.append("  " + (_setting_line(anchor_setting, allow_arch_changes) or "(fixed-reference defaults)"))
     lines.append("")
+
+    # ── MOTION PROFILE (Q5) — how the tracked person moves ───────────────────
+    if show_motion:
+        prof = _qual_motion_profile(motion_profile)
+        if prof:
+            lines.append("== MOTION PROFILE (how the tracked person moves) ==")
+            lines.append("  " + prof)
+            lines.append("")
 
     def _level_str(h: Dict[str, Any]) -> str:
         lvl = _qual_level_10(h.get("score"), all_scores)
@@ -145,6 +230,10 @@ def format_protocol_payload(
             shape = _qual_curve_shape(h.get("curve_summary"))
             if shape != "unknown":
                 lines.append(f"    training curve: {shape.replace('_', ' ')}")
+        if show_motion:
+            merr = _qual_motion_error(h.get("motion_error_summary"))
+            if merr:
+                lines.append(f"    motion error: {merr}")
         return lines
 
     # ── Best settings so far (top 5, RANKED best → worst) ─────────────────────
@@ -190,6 +279,10 @@ def format_protocol_payload(
                 shape = _qual_curve_shape(h.get("curve_summary"))
                 if shape != "unknown":
                     lines.append(f"    training curve: {shape.replace('_', ' ')}")
+            if show_motion:
+                merr = _qual_motion_error(h.get("motion_error_summary"))
+                if merr:
+                    lines.append(f"    motion error: {merr}")
             lines.append(f"    output: {h.get('output_status', 'clean')}")
             if is_finite_number(h.get("score")):
                 prev_score = h["score"]
