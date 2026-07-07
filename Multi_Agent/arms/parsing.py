@@ -12,8 +12,12 @@ from typing import Any, Dict, Optional
 
 from pipeline import is_finite_number
 
+from pipeline import LOSS_SHAPING_GRID
+
 from .labels import _normalize_diagnosis
 from .validation import ALLOWED_DIAGNOSES, ALLOWED_HP_KEYS
+
+LOSS_SHAPING_KEYS_SET = set(LOSS_SHAPING_GRID.keys())
 
 
 def _parse_scalar(raw_value: Any) -> Any:
@@ -174,6 +178,44 @@ def _parse_text_proposal(raw: str) -> Dict[str, Any]:
 def _parse_llm_proposal(raw: str) -> Dict[str, Any]:
     """Parse the warm-loop `key: value` response format (deprecated path)."""
     return _parse_text_proposal(raw)
+
+
+def _parse_loss_shaping_proposal(raw: str) -> Dict[str, Any]:
+    """Parse the motion loss-shaping reply (same 5-line format as the protocol
+    proposal, but the `changes:` line / direct lines carry LOSS_SHAPING levers
+    v_max / lambda_vel / lambda_smooth / bin_weight_* instead of HPs)."""
+    text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    text = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+
+    fields: Dict[str, str] = {}
+    direct: Dict[str, Any] = {}
+    for line in text.splitlines():
+        clean = re.sub(r"^\s*[-*+]\s+", "", line.strip()).replace("**", "").strip()
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_ ]*)\s*[:=]\s*(.+)$", clean)
+        if not m:
+            continue
+        key = m.group(1).strip().lower().replace(" ", "_")
+        val = m.group(2).strip()
+        if key in LOSS_SHAPING_KEYS_SET:
+            direct[key] = _parse_scalar(val)
+        elif key in ("diagnosis", "strategy", "changes", "reason", "reasoning", "confidence"):
+            fields[key] = val
+
+    changes: Dict[str, Any] = {}
+    ctext = fields.get("changes")
+    if ctext:
+        for key in LOSS_SHAPING_KEYS_SET:
+            mm = re.search(rf"\b{re.escape(key)}\b\s*(?:=|:|->|to)\s*([-+]?[0-9]*\.?[0-9]+)", str(ctext), re.IGNORECASE)
+            if mm:
+                changes[key] = _parse_scalar(mm.group(1))
+    changes.update(direct)
+    return {
+        "diagnosis": _normalize_diagnosis(fields.get("diagnosis")),
+        "strategy":  (fields.get("strategy") or "exploit").strip().lower(),
+        "proposed_changes": changes,
+        "reason":    (fields.get("reason") or fields.get("reasoning") or "").strip(),
+        "confidence": (fields.get("confidence") or "medium").strip().lower(),
+    }
 
 
 def _parse_protocol_proposal(raw: str) -> Dict[str, Any]:

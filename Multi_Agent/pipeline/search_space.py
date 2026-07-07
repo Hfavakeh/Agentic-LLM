@@ -42,13 +42,41 @@ NUMERIC_HP_KEYS: Set[str] = {
 # authoritative membership test.
 HP_BOUNDS = {k: (min(v), max(v)) for k, v in HP_GRID.items() if k in NUMERIC_HP_KEYS}
 
-# Motion-aware loss-shaping levers (Phase-3 scientific core). DEFERRED from the
-# search space for the main protocol run — the loss-shaping machinery in the
-# Trainer stays intact for a later motion experiment, but no arm tunes these
-# for now (motion still feeds the LLM prompt qualitatively, per step 6g).
+# Motion-aware loss-shaping levers (Phase-3 scientific core / motion thesis).
+# These reshape the TRAINING OBJECTIVE, not the optimiser. They are DEFERRED
+# from the main protocol run (the 9-HP bake-off does not tune them), but the
+# motion experiment (--motion-experiment) uses LOSS_SHAPING_GRID below as its
+# search space with the 9 conventional HPs frozen at baseline.
 LOSS_SHAPING_KEYS: Set[str] = {
     "v_max", "lambda_vel", "lambda_smooth",
     "bin_weight_slow", "bin_weight_medium", "bin_weight_fast",
 }
+
+# Discrete search grid for the loss-shaping levers, in the same style as
+# HP_GRID (single source of truth for every motion arm — LLM validator, random,
+# and the motion rule-based controller). The NEUTRAL value is included for each
+# lever so "no shaping" (plain MSE) is reachable: lambda_vel=0 / lambda_smooth=0
+# switch a penalty off, bin weights of 1.0 are neutral. `v_max` only bites when
+# lambda_vel > 0 (it is the plausible top human speed in m/s).
+LOSS_SHAPING_GRID = {
+    "v_max":            [1.0, 1.5, 2.0, 2.5, 3.0],
+    "lambda_vel":       [0.0, 0.05, 0.1, 0.2, 0.3],
+    "lambda_smooth":    [0.0, 0.05, 0.1, 0.2, 0.3],
+    "bin_weight_slow":  [0.5, 1.0, 1.5, 2.0, 3.0],
+    "bin_weight_medium":[0.5, 1.0, 1.5, 2.0, 3.0],
+    "bin_weight_fast":  [0.5, 1.0, 1.5, 2.0, 3.0],
+}
+
+# The neutral (plain-MSE) loss-shaping vector — the motion experiment's ANCHOR
+# start point, so the LLM/controller propose moves AWAY from "no shaping".
+LOSS_SHAPING_NEUTRAL = {
+    "v_max": 2.0, "lambda_vel": 0.0, "lambda_smooth": 0.0,
+    "bin_weight_slow": 1.0, "bin_weight_medium": 1.0, "bin_weight_fast": 1.0,
+}
+
+# Continuous bounds DERIVED from the discrete lever grid (min/max per lever),
+# mirroring HP_BOUNDS. Used by range-normalising helpers and the motion
+# rule-based controller's v_max clamp.
+LOSS_SHAPING_BOUNDS = {k: (min(v), max(v)) for k, v in LOSS_SHAPING_GRID.items()}
 
 OPTIMIZER_CHOICES = list(HP_GRID["optimizer_choice"])

@@ -9,7 +9,7 @@ The legacy warm-loop soft validator (clamp/snap/auto-correct) lives in
 
 from typing import Any, Dict
 
-from pipeline import HP_GRID, OPTIMIZER_CHOICES
+from pipeline import HP_GRID, LOSS_SHAPING_GRID, OPTIMIZER_CHOICES
 
 # ---------------------------------------------------------------------------
 # Validation constants
@@ -102,10 +102,66 @@ def validate_protocol_changes(
     return resolved, True, ""
 
 
+# ---------------------------------------------------------------------------
+# Motion experiment — loss-shaping lever validation (same hard-validation
+# contract as the HP path: grid membership + not-already-tried, no repair).
+# ---------------------------------------------------------------------------
+
+LOSS_SHAPING_KEYS_ORDERED = [
+    "v_max", "lambda_vel", "lambda_smooth",
+    "bin_weight_slow", "bin_weight_medium", "bin_weight_fast",
+]
+
+
+def _lever_in_grid(key: str, val: Any) -> bool:
+    grid = LOSS_SHAPING_GRID.get(key)
+    if grid is None:
+        return False
+    try:
+        fv = float(val)
+    except (TypeError, ValueError):
+        return False
+    return any(abs(fv - float(g)) <= 1e-9 + 1e-6 * abs(float(g)) for g in grid)
+
+
+def _snap_lever(key: str, val: Any) -> Any:
+    grid = LOSS_SHAPING_GRID.get(key, [])
+    fv = float(val)
+    return min(grid, key=lambda g: abs(float(g) - fv))
+
+
+def validate_loss_shaping_changes(
+    changes: Dict[str, Any],
+    anchor: Dict[str, Any],
+    is_tried,
+) -> tuple:
+    """Hard-validate a proposed loss-shaping lever vector against
+    LOSS_SHAPING_GRID and the already-tried set (motion experiment).
+
+    Returns (resolved_vector, ok, reason). The resolved vector is the anchor
+    (neutral / best-so-far levers) overlaid with the snapped proposed levers,
+    so a partial proposal still yields a full 6-lever vector. No silent repair:
+    an out-of-grid value, an unknown lever, or a repeat all fail.
+    """
+    if not isinstance(changes, dict):
+        return None, False, "no_changes_parsed"
+    for k, v in changes.items():
+        if k not in LOSS_SHAPING_GRID:
+            return None, False, f"unknown_lever:{k}"
+        if not _lever_in_grid(k, v):
+            return None, False, f"value_not_in_grid:{k}={v}"
+    resolved = {**anchor, **{k: _snap_lever(k, v) for k, v in changes.items()}}
+    if is_tried(resolved):
+        return None, False, "already_tried"
+    return resolved, True, ""
+
+
 def _human_reason(reason: str) -> str:
     """Turn a validate_protocol_changes tag into one line of LLM feedback."""
     if reason.startswith("unknown_param:"):
         return f"'{reason.split(':',1)[1]}' is not a tunable parameter."
+    if reason.startswith("unknown_lever:"):
+        return f"'{reason.split(':',1)[1]}' is not a loss-shaping lever."
     if reason.startswith("arch_frozen:"):
         return f"{reason.split(':',1)[1]} is fixed this run; do not change it."
     if reason.startswith("value_not_in_grid:"):

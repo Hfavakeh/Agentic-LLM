@@ -70,6 +70,26 @@ def extract_motion_features(targets: np.ndarray, hz: float = DEFAULT_HZ) -> pd.D
 
     speed_mps = np.hypot(dx, dy) * hz
 
+    # Acceleration: rate of change of speed (m/s^2). First two samples NaN
+    # (needs two consecutive valid speeds).
+    accel_mps2 = np.concatenate([[np.nan], np.diff(speed_mps)]) * hz
+
+    # Jerk: rate of change of acceleration (m/s^3) — a per-sample smoothness /
+    # roughness signal (large |jerk| = jagged motion).
+    jerk_mps3 = np.concatenate([[np.nan], np.diff(accel_mps2)]) * hz
+
+    # Turning: change in heading direction between consecutive steps, in
+    # degrees. Heading is atan2(dy, dx); the per-step turn is the wrapped
+    # difference of consecutive headings. Only meaningful while actually
+    # moving, so turns at stationary samples (speed below threshold, where the
+    # heading is just jitter) are masked to NaN.
+    heading = np.arctan2(dy, dx)                       # radians, NaN at sample 0
+    dheading = np.concatenate([[np.nan], np.diff(heading)])
+    dheading = (dheading + np.pi) % (2.0 * np.pi) - np.pi   # wrap to (-pi, pi]
+    turn_deg = np.degrees(dheading)
+    moving = speed_mps >= STATIONARY_THRESHOLD_MPS
+    turn_deg = np.where(moving & np.roll(moving, 1), turn_deg, np.nan)
+
     # Dwell / stop-go: a sample is "stop" when speed is below the stationary
     # threshold (NaN treated as stop, since the first sample has no defined
     # velocity). `dwell_run_len_samples` is the length of the current
@@ -90,6 +110,10 @@ def extract_motion_features(targets: np.ndarray, hz: float = DEFAULT_HZ) -> pd.D
         "dx":                    dx,
         "dy":                    dy,
         "speed":                 speed_mps,  # m/s
+        "accel":                 accel_mps2, # m/s^2
+        "jerk":                  jerk_mps3,  # m/s^3
+        "heading_rad":           heading,
+        "turn_deg":              turn_deg,   # per-step heading change (deg)
         "dwell_state":           state,
         "dwell_run_len_samples": run_len,
     })
@@ -159,6 +183,45 @@ def summarize_dwell(df: pd.DataFrame, hz: float = DEFAULT_HZ) -> Dict[str, objec
     }
 
 
+def summarize_dynamics(df: pd.DataFrame) -> Dict[str, object]:
+    """Acceleration, turning and trajectory-roughness statistics (the motion
+    features the professor named beyond speed / stop-go).
+
+    - acceleration: magnitude of speed change (m/s^2) — mean, std, p95 of |accel|.
+    - turning: per-step heading change (deg, while moving) — mean, p95 of |turn|
+      and the share of sharp turns (>45 deg).
+    - roughness: `path_sinuosity` = total path length / net start-end
+      displacement (1.0 = straight line; larger = more winding), plus mean
+      |jerk| (m/s^3), a per-sample jaggedness signal.
+    """
+    accel = df["accel"].dropna().abs() if "accel" in df.columns else pd.Series(dtype=float)
+    jerk  = df["jerk"].dropna().abs()  if "jerk"  in df.columns else pd.Series(dtype=float)
+    turn  = df["turn_deg"].dropna().abs() if "turn_deg" in df.columns else pd.Series(dtype=float)
+
+    # Path sinuosity from the per-step displacements.
+    sinuosity = float("nan")
+    if {"dx", "dy", "x", "y"}.issubset(df.columns) and len(df) > 1:
+        step = np.hypot(df["dx"].to_numpy(), df["dy"].to_numpy())
+        path_len = float(np.nansum(step))
+        net = float(np.hypot(df["x"].iloc[-1] - df["x"].iloc[0],
+                             df["y"].iloc[-1] - df["y"].iloc[0]))
+        sinuosity = path_len / net if net > 1e-9 else float("nan")
+
+    def _f(v):
+        return float(v) if np.isfinite(v) else float("nan")
+
+    return {
+        "accel_abs_mean_mps2": _f(accel.mean()) if len(accel) else float("nan"),
+        "accel_std_mps2":      _f(df["accel"].dropna().std()) if "accel" in df.columns and df["accel"].notna().any() else float("nan"),
+        "accel_abs_p95_mps2":  _f(accel.quantile(0.95)) if len(accel) else float("nan"),
+        "turn_abs_mean_deg":   _f(turn.mean()) if len(turn) else float("nan"),
+        "turn_abs_p95_deg":    _f(turn.quantile(0.95)) if len(turn) else float("nan"),
+        "sharp_turn_share":    _f((turn > 45.0).mean()) if len(turn) else float("nan"),
+        "path_sinuosity":      sinuosity,
+        "jerk_abs_mean_mps3":  _f(jerk.mean()) if len(jerk) else float("nan"),
+    }
+
+
 def summarize_motion(df: pd.DataFrame, hz: float = DEFAULT_HZ) -> Dict[str, object]:
     """Return interpretable summary stats over a motion-features DataFrame.
 
@@ -179,6 +242,7 @@ def summarize_motion(df: pd.DataFrame, hz: float = DEFAULT_HZ) -> Dict[str, obje
         "speed_min_mps":         float(speed.min())  if len(speed) else float("nan"),
         "speed_max_mps":         float(speed.max())  if len(speed) else float("nan"),
         "speed_quantiles_mps":   _q(speed),
+        "dynamics":              summarize_dynamics(df),
         "dwell":                 summarize_dwell(df, hz=hz),
     }
 
@@ -213,6 +277,50 @@ def error_payload(
     }
 
 
+def per_regime_error(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    hz: float = DEFAULT_HZ,
+    **_ignored,
+) -> Dict[str, object]:
+    """Mean position error (metres) split by MOTION REGIME (Q5).
+
+    Speed at each predicted sample is derived from the target trajectory
+    (``||Δposition|| * hz``, matching ``extract_motion_features``) and bucketed
+    into slow / medium / fast by the terciles of that speed. The mean Euclidean
+    error is reported per regime, plus which regime is worst and how large the
+    spread is (worst/best ratio). This is the "errors in different motion
+    regimes" signal the professor asked about; it is rendered as a qualitative
+    label in the prompt, never as raw numbers.
+
+    Returns {"slow","medium","fast": float|None, "worst_regime": str|None,
+    "spread_ratio": float|None, "n": int}.
+    """
+    idx = np.arange(len(targets) - len(preds), len(targets))
+    tgt = np.asarray(targets)[idx]
+    euc = np.sqrt(((np.asarray(preds) - tgt) ** 2).sum(axis=1))
+    # per-sample speed from consecutive targets (first sample -> 0)
+    d = np.diff(tgt, axis=0)
+    speed = np.concatenate([[0.0], np.hypot(d[:, 0], d[:, 1]) * hz]) if len(tgt) > 1 else np.zeros(len(tgt))
+    out: Dict[str, object] = {"slow": None, "medium": None, "fast": None,
+                              "worst_regime": None, "spread_ratio": None, "n": int(len(euc))}
+    if len(euc) < 6:
+        return out
+    lo, hi = np.quantile(speed, [1 / 3, 2 / 3])
+    masks = {"slow": speed <= lo, "medium": (speed > lo) & (speed <= hi), "fast": speed > hi}
+    means = {}
+    for name, m in masks.items():
+        if m.any():
+            means[name] = float(euc[m].mean())
+            out[name] = round(means[name], 4)
+    if means:
+        worst = max(means, key=means.get)
+        best_v = min(means.values())
+        out["worst_regime"] = worst
+        out["spread_ratio"] = round(max(means.values()) / best_v, 3) if best_v > 0 else None
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Compact LLM-payload form
 # ---------------------------------------------------------------------------
@@ -233,6 +341,7 @@ def llm_payload(summary: Dict[str, object]) -> Dict[str, object]:
             return None
 
     dwell = summary.get("dwell", {}) or {}
+    dyn = summary.get("dynamics", {}) or {}
     return {
         "speed_mean_mps":   _r(summary.get("speed_mean_mps")),
         "speed_std_mps":    _r(summary.get("speed_std_mps")),
@@ -241,6 +350,15 @@ def llm_payload(summary: Dict[str, object]) -> Dict[str, object]:
         "speed_median_mps": _r(sq["p50"]),
         "speed_iqr_mps":    _r(sq["p75"] - sq["p25"]),
         "speed_p95_mps":    _r(sq["p95"]),
+        # Acceleration / turning / roughness — the motion features the professor
+        # named beyond speed and stop-go.
+        "accel_abs_mean_mps2": _r(dyn.get("accel_abs_mean_mps2"), 3),
+        "accel_abs_p95_mps2":  _r(dyn.get("accel_abs_p95_mps2"), 3),
+        "turn_abs_mean_deg":   _r(dyn.get("turn_abs_mean_deg"), 2),
+        "turn_abs_p95_deg":    _r(dyn.get("turn_abs_p95_deg"), 2),
+        "sharp_turn_share":    _r(dyn.get("sharp_turn_share"), 3),
+        "path_sinuosity":      _r(dyn.get("path_sinuosity"), 3),
+        "jerk_abs_mean_mps3":  _r(dyn.get("jerk_abs_mean_mps3"), 3),
         # Dwell / stop-go — describes hesitation/pause behaviour.
         "dwell": {
             "stop_share":            _r(dwell.get("stop_share"), 3),

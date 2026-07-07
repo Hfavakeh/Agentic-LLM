@@ -121,6 +121,12 @@ class Config:
     # `explore_prompt`; only affects the LLM arm.
     opro_prompt: bool = False
 
+    # `motion_experiment` switches the whole run from the 9-HP bake-off to the
+    # motion-thesis loss-shaping experiment: the 9 HPs are frozen at baseline and
+    # the arms (baseline / C2 motion heuristic / random / C3 LLM) search the six
+    # loss-shaping levers from motion summaries. Implies motion payload on.
+    motion_experiment: bool = False
+
     # `history_ablation` is the Q3 history-use placebo probe. It perturbs the
     # RENDERED history context the LLM proposer sees (NOT the engine's training)
     # to test whether the LLM actually uses history or mostly ignores it:

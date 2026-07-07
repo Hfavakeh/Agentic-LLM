@@ -16,7 +16,8 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from motion_descriptors import (
-    extract_motion_features, llm_payload as motion_llm_payload, summarize_motion,
+    extract_motion_features, llm_payload as motion_llm_payload, per_regime_error,
+    summarize_motion,
 )
 from pipeline import (
     Config, DataProcessor, Evaluator, LSTM_Localizer, TimeSeriesDataset, Trainer,
@@ -144,9 +145,16 @@ def evaluate_setting(
     setting: Dict[str, Any],
     train_seeds: tuple = TRAIN_SEEDS,
     max_epochs: Optional[int] = None,
+    loss_shaping: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Train one HP setting once per seed in *train_seeds*, from scratch, and
     return its averaged validation result.
+
+    ``loss_shaping`` (motion experiment): when given, the flat lever dict
+    (v_max / lambda_vel / lambda_smooth / bin_weight_*) is applied to each
+    seed's Trainer via ``apply_loss_shaping_update`` BEFORE training, reshaping
+    the training objective while the 9 conventional HPs stay at ``setting`` (the
+    frozen baseline). Per-regime val error is always computed in this mode.
 
     score == val_rmse_mean == mean over seeds of the best-epoch validation
     RMSE in METRES (sqrt of the position MSE on inverse-transformed
@@ -197,6 +205,8 @@ def evaluate_setting(
             train_loader=train_loader, val_loader=val_loader,
             dataset_dict=dataset, checkpoint_prefix="setting",
         )
+        if loss_shaping:
+            trainer.apply_loss_shaping_update(loss_shaping)
         _ts = time.perf_counter()
         trainer.train()
         runtime_s = time.perf_counter() - _ts
@@ -236,6 +246,18 @@ def evaluate_setting(
         # label only in the prompt; raw numbers stay here / in the logs.
         curve = _curve_features([v for v in pos_m if is_finite_number(v)],
                                 epochs_trained=len(vl), max_epochs=max_epochs)
+        # ── Per-regime validation error (Q5) — only when motion payload is on ──
+        # One extra val forward pass on the restored best-epoch weights, split
+        # into slow/medium/fast by target speed. Gated so the non-motion arms
+        # pay nothing.
+        motion_err = None
+        if getattr(base_cfg, "payload_motion", False) or loss_shaping is not None:
+            try:
+                m_eval = Evaluator(trainer.model, cfg, proc.scaler_y)
+                vp, vt = m_eval.predict(val_loader)
+                motion_err = per_regime_error(vp, vt, hz=cfg.hz)
+            except Exception as exc:  # noqa: BLE001 - never let this abort a training
+                logger.warning("Per-regime val error failed: %s", exc)
         per_seed.append({
             "seed":           int(seed),
             "val_rmse":       val_rmse,
@@ -246,6 +268,7 @@ def evaluate_setting(
             "train_val_gap":  (vl_at - tr_at) if (is_finite_number(vl_at) and is_finite_number(tr_at)) else float("nan"),
             "runtime_s":      runtime_s,
             "curve":          curve,
+            "motion_error":   motion_err,
         })
 
     def _mean(key: str) -> float:
@@ -264,9 +287,11 @@ def evaluate_setting(
         "mean_val_loss":   _mean("val_loss"),
         "mean_train_val_gap": _mean("train_val_gap"),
         "curve_summary":   _aggregate_curves([p.get("curve") for p in per_seed]),
+        "motion_error_summary": _aggregate_motion([p.get("motion_error") for p in per_seed]),
         "runtime_s":       float(time.perf_counter() - t0),
         "n_trainings":     len(per_seed),
         "setting":         setting,
+        "loss_shaping":    dict(loss_shaping) if loss_shaping else None,
         "per_seed":        per_seed,
     }
 
@@ -302,6 +327,29 @@ def _curve_features(vc: List[float], epochs_trained: int, max_epochs: int) -> Op
     }
 
 
+def _aggregate_motion(errs: List[Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+    """Average the per-seed per-regime errors and recompute the worst regime +
+    spread from the means (Q5). Empty when motion payload was off."""
+    valid = [e for e in errs if isinstance(e, dict) and e.get("worst_regime")]
+    if not valid:
+        return {}
+    means = {}
+    for regime in ("slow", "medium", "fast"):
+        vals = [e[regime] for e in valid if is_finite_number(e.get(regime))]
+        if vals:
+            means[regime] = float(np.mean(vals))
+    if not means:
+        return {}
+    worst = max(means, key=means.get)
+    best_v = min(means.values())
+    return {
+        **{k: round(v, 4) for k, v in means.items()},
+        "worst_regime": worst,
+        "spread_ratio": round(max(means.values()) / best_v, 3) if best_v > 0 else None,
+        "n_seeds": len(valid),
+    }
+
+
 def _aggregate_curves(curves: List[Optional[Dict[str, float]]]) -> Dict[str, float]:
     """Average the per-seed curve features into the run-level summary the
     qualitative `_qual_curve_shape` label reads."""
@@ -327,12 +375,17 @@ def train_and_test_setting(
     setting: Dict[str, Any],
     seed: int,
     max_epochs: Optional[int] = None,
+    loss_shaping: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Train one setting from scratch on a single seed and evaluate it on the
     TEST set. Used ONLY after a method has selected its best setting (the
     protocol allows the test set only at that point). The final evaluation
     calls this across the 30 fresh seeds; the interim search arms call it once
     on a training seed just to populate the legacy `metrics`/plots slots.
+
+    ``loss_shaping`` (motion experiment): applied to the Trainer before training
+    so the final test eval uses the same reshaped objective the setting was
+    selected under, with the 9 HPs frozen at ``setting`` (baseline).
     """
     setting = _coerce_setting(setting, getattr(base_cfg, "allow_arch_changes", True))
     max_epochs = int(max_epochs or base_cfg.epochs_per_round)
@@ -365,6 +418,8 @@ def train_and_test_setting(
         train_loader=train_loader, val_loader=val_loader,
         dataset_dict=dataset, checkpoint_prefix="eval",
     )
+    if loss_shaping:
+        trainer.apply_loss_shaping_update(loss_shaping)
     trainer.train()   # early stopping restores the best-epoch weights
     evaluator = Evaluator(trainer.model, cfg, proc.scaler_y)
     preds, targets = evaluator.predict(test_loader)

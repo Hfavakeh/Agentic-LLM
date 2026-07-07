@@ -24,12 +24,16 @@ from autogen_ext.models.ollama import OllamaChatCompletionClient
 from pipeline import logger, sanitize_for_json
 
 from .legacy import SemanticRepairRequired, _format_history, _format_payload_as_text, _validate_proposal
-from .parsing import _parse_llm_proposal, _parse_protocol_proposal
-from .prompts import (
-    format_opro_payload, format_protocol_payload, opro_system_prompt,
-    protocol_system_prompt,
+from .parsing import (
+    _parse_llm_proposal, _parse_loss_shaping_proposal, _parse_protocol_proposal,
 )
-from .validation import _human_reason, validate_protocol_changes
+from .prompts import (
+    format_motion_loss_payload, format_opro_payload, format_protocol_payload,
+    motion_loss_system_prompt, opro_system_prompt, protocol_system_prompt,
+)
+from .validation import (
+    _human_reason, validate_loss_shaping_changes, validate_protocol_changes,
+)
 
 
 # Outcome fields that, together, define a setting's rendered quality. The Q3
@@ -530,6 +534,119 @@ w_res: <0.0 to 1.0>
 
         self.retry_stats["rejected"] += 1
         logger.warning("LLM proposal rejected after %d attempt(s): %s",
+                       self.max_retries + 1, last_reason)
+        return _finish({
+            "valid":          False,
+            "output_status":  "rejected",
+            "proposed_changes": last_parsed.get("proposed_changes", {}),
+            "diagnosis":      last_parsed.get("diagnosis", "inconclusive"),
+            "failure_reason": last_reason,
+            "raw":            raw_last,
+        })
+
+    # ------------------------------------------------------------------
+    # Motion experiment path: propose a loss-shaping lever vector
+    # ------------------------------------------------------------------
+
+    async def propose_loss_shaping(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Motion-thesis entry point (C3): read the motion summaries + per-regime
+        error + tried lever vectors, propose a COMPLETE loss-shaping lever vector,
+        hard-validate it against LOSS_SHAPING_GRID and the already-tried set,
+        retry ONCE, else reject. Mirrors `propose_setting` but over the six
+        loss-shaping levers (the 9 HPs are frozen at baseline)."""
+        for k in ("valid_first_try", "valid_after_retry", "rejected",
+                  "repeats_proposed", "invalid_values"):
+            self.retry_stats.setdefault(k, 0)
+        if not hasattr(self, "_motion_prompt"):
+            self._motion_prompt = motion_loss_system_prompt()
+
+        anchor    = context.get("anchor_levers") or {}
+        is_tried  = context.get("is_tried") or (lambda s: False)
+        history   = context.get("history", [])
+        motion_profile = context.get("motion_profile", {})
+        regime_err = context.get("anchor_regime_error")
+
+        base_user = format_motion_loss_payload(history, anchor, motion_profile, regime_err)
+        feedback = ""
+        last_reason = "unknown"
+        last_parsed: Dict[str, Any] = {}
+        raw_last = ""
+
+        log_entry: Dict[str, Any] = {
+            "timestamp":        datetime.now().isoformat(),
+            "attempt_index":    len(self.protocol_log) + 1,
+            "mode":             "motion_loss_shaping",
+            "anchor_levers":    dict(anchor),
+            "n_history":        len(history),
+            "rendered_payload": base_user,
+            "sub_attempts":     [],
+            "outcome":          "pending",
+        }
+
+        def _finish(result: Dict[str, Any]) -> Dict[str, Any]:
+            log_entry["outcome"] = "accepted" if result.get("valid") else "rejected"
+            log_entry["final_reason"] = result.get("failure_reason", "")
+            log_entry["resolved_setting"] = result.get("resolved_setting")
+            self.protocol_log.append(log_entry)
+            return result
+
+        for attempt in range(self.max_retries + 1):
+            user_text = base_user if not feedback else (
+                base_user + f"\n\nYOUR PREVIOUS REPLY WAS REJECTED: {feedback}\n"
+                "Reply again, in the exact format, with a different valid lever vector.")
+            sub: Dict[str, Any] = {"attempt": attempt, "raw": None, "parsed_changes": None, "status": None}
+            raw, err = await self._protocol_raw_call(self._motion_prompt, user_text)
+            if err:
+                last_reason = err
+                feedback = (f"the previous call did not return a usable reply ({err}); "
+                            "reply concisely in the exact format.")
+                sub["status"] = err
+                log_entry["sub_attempts"].append(sub)
+                continue
+            raw_last = raw
+            sub["raw"] = raw
+            try:
+                parsed = _parse_loss_shaping_proposal(raw)
+            except Exception as exc:
+                self.retry_stats["parse_failures"] += 1
+                last_reason = f"parse_error:{exc}"
+                feedback = "your reply could not be parsed; output exactly the 5 fields, one per line."
+                sub["status"] = last_reason
+                log_entry["sub_attempts"].append(sub)
+                continue
+            last_parsed = parsed
+            sub["parsed_changes"] = parsed.get("proposed_changes", {})
+            resolved, ok, reason = validate_loss_shaping_changes(
+                parsed.get("proposed_changes", {}), anchor, is_tried,
+            )
+            sub["status"] = "ok" if ok else reason
+            log_entry["sub_attempts"].append(sub)
+            if ok:
+                status = "clean" if attempt == 0 else "accepted_after_retry"
+                if attempt == 0:
+                    self.retry_stats["valid_first_try"] += 1
+                else:
+                    self.retry_stats["valid_after_retry"] += 1
+                return _finish({
+                    "valid":            True,
+                    "resolved_setting": resolved,
+                    "proposed_changes": parsed.get("proposed_changes", {}),
+                    "diagnosis":        parsed.get("diagnosis", "inconclusive"),
+                    "strategy":         parsed.get("strategy", ""),
+                    "reason":           parsed.get("reason", ""),
+                    "confidence":       parsed.get("confidence", "medium"),
+                    "output_status":    status,
+                    "raw":              raw,
+                })
+            if reason == "already_tried":
+                self.retry_stats["repeats_proposed"] += 1
+            elif reason.startswith("value_not_in_grid") or reason.startswith("unknown_lever"):
+                self.retry_stats["invalid_values"] += 1
+            last_reason = reason
+            feedback = _human_reason(reason)
+
+        self.retry_stats["rejected"] += 1
+        logger.warning("LLM loss-shaping proposal rejected after %d attempt(s): %s",
                        self.max_retries + 1, last_reason)
         return _finish({
             "valid":          False,

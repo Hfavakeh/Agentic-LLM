@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import List
 
 from experiments import EXPERIMENT_SEEDS, run_full_experiment, run_multi_seed_experiment
+from experiments.final_eval import FINAL_EVAL_SEEDS_POOL
 from pipeline import Config, logger
 
 
@@ -142,6 +143,31 @@ def parse_args():
     )
 
     p.add_argument(
+        "--motion-experiment", action="store_true", dest="motion_experiment",
+        help=(
+            "Run the MOTION-THESIS experiment instead of the 9-HP bake-off: the "
+            "9 conventional HPs are frozen at baseline and the arms search the "
+            "six loss-shaping levers (v_max, lambda_vel/smooth, bin weights) from "
+            "motion summaries. Arms: baseline (plain MSE), C2 (motion heuristic), "
+            "random, C3 (LLM). Tests whether the LLM's motion interpretation "
+            "beats a fixed motion heuristic (C3 vs C2) and whether motion "
+            "loss-shaping helps at all (C2 vs baseline)."
+        ),
+    )
+
+    p.add_argument(
+        "--motion-arms", nargs="+", dest="motion_arms",
+        choices=["baseline", "motion_rule", "random", "llm"], default=["llm"],
+        help=(
+            "Which motion-experiment arms to run (default: llm only). The "
+            "baseline (plain MSE, HPs frozen) equals the HP bake-off's baseline "
+            "so it never needs recomputing; add 'motion_rule' for the C2 "
+            "heuristic comparator (cheap, one deterministic vector) when you need "
+            "the C3-vs-C2 comparison. Only used with --motion-experiment."
+        ),
+    )
+
+    p.add_argument(
         "--opro-prompt", action="store_true", dest="opro_prompt",
         help=(
             "OPRO prompt-variant (LLM arm only; Email-5 diagnostic): replace the "
@@ -241,6 +267,16 @@ def build_config(args) -> Config:
             "untried regions instead of a small change vs the anchor."
         )
 
+    # Motion-thesis experiment: freeze HPs, search loss-shaping levers from
+    # motion summaries. Implies the motion payload (per-regime error) is on.
+    cfg.motion_experiment = bool(getattr(args, "motion_experiment", False))
+    if cfg.motion_experiment:
+        cfg.payload_motion = True
+        logger.info(
+            "MOTION EXPERIMENT enabled: 9 HPs frozen at baseline; arms search the "
+            "6 loss-shaping levers (baseline / C2 heuristic / random / C3 LLM)."
+        )
+
     # OPRO prompt-variant (Email-5): raw (setting, score) trajectory + ask for a
     # full new candidate. Overrides explore_prompt for the LLM arm.
     cfg.opro_prompt = bool(getattr(args, "opro_prompt", False))
@@ -312,6 +348,44 @@ def build_config(args) -> Config:
     return cfg
 
 
+async def run_motion_over_seeds(config: Config, seeds: List[int], llm_model: str,
+                                arms_to_run=("llm",)):
+    """Motion-thesis experiment across seeds: per seed, build a fresh dataset +
+    LLM agent, run the loss-shaping bake-off, and write per-seed results."""
+    import copy as _copy
+
+    from arms.engine import build_dataset_and_loaders
+    from arms.llm import SingleAgentOptimizer
+    from arms.motion import run_motion_experiment, save_motion_results
+
+    n_final = int(getattr(config, "n_final_eval_seeds", 30))
+    fe_seeds = list(FINAL_EVAL_SEEDS_POOL[:n_final])
+    for seed in seeds:
+        logger.info("##### MOTION experiment | seed %d #####", seed)
+        cfg = _copy.deepcopy(config)
+        cfg.output_dir = Path(config.output_dir) / f"seed_{seed}"
+        cfg.output_dir.mkdir(parents=True, exist_ok=True)
+        dataset, *_ = build_dataset_and_loaders(cfg)
+        agent = SingleAgentOptimizer(
+            model_name=llm_model,
+            allow_arch_changes=cfg.allow_arch_changes,
+            semantic_repair=getattr(cfg, "semantic_repair", False),
+            payload_motion=True,
+        )
+        try:
+            results = await run_motion_experiment(
+                cfg, dataset, agent,
+                n_attempts=cfg.optimization_rounds,
+                final_eval_seeds=fe_seeds,
+                run_id=1,
+                arms_to_run=tuple(arms_to_run),
+            )
+            save_motion_results(results, cfg.output_dir, run_id=1)
+            agent.save_protocol_log(str(cfg.output_dir / "motion_protocol_log_run1.json"))
+        finally:
+            await agent.close()
+
+
 async def main():
     args   = parse_args()
     config = build_config(args)
@@ -339,7 +413,13 @@ async def main():
         logger.info("  seed           : %d (single-seed mode)", seeds[0])
     logger.info("==" * 30)
 
-    if use_multi_seed:
+    if getattr(config, "motion_experiment", False):
+        # ── Motion-thesis experiment (loss-shaping levers, HPs frozen) ────
+        await run_motion_over_seeds(
+            config, seeds, args.model,
+            arms_to_run=getattr(args, "motion_arms", ["llm"]),
+        )
+    elif use_multi_seed:
         # ── Multi-Seed Runner ────────────────────────────────────────────
         await run_multi_seed_experiment(
             base_config=config,

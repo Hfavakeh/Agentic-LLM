@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from pipeline import HP_BOUNDS, is_finite_number, logger
+from pipeline import HP_BOUNDS, LOSS_SHAPING_BOUNDS, is_finite_number, logger
 
 from .labels import (
     CURVE_SHAPE_TO_DIAGNOSIS, _behavior_label, _qual_curve_shape,
@@ -515,7 +515,7 @@ class MotionAwareRuleBasedOptimizer(RuleBasedOptimizer):
         }
         p95 = profile.get("speed_p95_mps")
         if is_finite_number(p95):
-            lo, hi = HP_BOUNDS["v_max"]
+            lo, hi = LOSS_SHAPING_BOUNDS["v_max"]
             targets["v_max"] = round(min(hi, max(lo, float(p95) * self._V_MAX_MARGIN)), 4)
 
         # Only propose what differs from the current active value (mirrors the

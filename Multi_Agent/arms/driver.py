@@ -45,6 +45,7 @@ async def run_proposer_search(
             "max_epochs":         max_epochs,
             "allow_arch_changes": allow_arch,
             "is_tried":           is_tried,
+            "motion_profile":     dataset.get("motion_profile", {}),
         }
         proposal = await agent.propose_setting(context)
 
@@ -99,6 +100,7 @@ async def run_proposer_search(
             "mean_val_loss": result["mean_val_loss"],
             "mean_train_val_gap": result["mean_train_val_gap"],
             "curve_summary": result.get("curve_summary", {}),
+            "motion_error_summary": result.get("motion_error_summary", {}),
             "runtime_s": result["runtime_s"],
             "changes_from_anchor": proposal.get("proposed_changes", {}) or {},
             "diagnosis": proposal.get("diagnosis"), "strategy": proposal.get("strategy"),
