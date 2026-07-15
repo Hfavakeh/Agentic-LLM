@@ -168,6 +168,17 @@ def parse_args():
     )
 
     p.add_argument(
+        "--motion-no-profile", action="store_true", dest="motion_no_profile",
+        help=(
+            "Motion control ablation (Email-7 point 5): the LLM loss-shaping arm "
+            "sees the per-regime error feedback but NOT the motion-summary block "
+            "(speed / turning / stop-go interpretation). Isolates whether the "
+            "motion interpretation adds anything over the raw error signal. Use "
+            "with --motion-experiment --motion-arms llm."
+        ),
+    )
+
+    p.add_argument(
         "--opro-prompt", action="store_true", dest="opro_prompt",
         help=(
             "OPRO prompt-variant (LLM arm only; Email-5 diagnostic): replace the "
@@ -277,6 +288,14 @@ def build_config(args) -> Config:
             "6 loss-shaping levers (baseline / C2 heuristic / random / C3 LLM)."
         )
 
+    # Email-7 point 5 control: LLM sees per-regime error only, no motion summary.
+    cfg.motion_no_profile = bool(getattr(args, "motion_no_profile", False))
+    if cfg.motion_no_profile:
+        logger.info(
+            "MOTION NO-PROFILE ablation: the LLM loss-shaping arm sees per-regime "
+            "error feedback but NOT the motion-summary block."
+        )
+
     # OPRO prompt-variant (Email-5): raw (setting, score) trajectory + ask for a
     # full new candidate. Overrides explore_prompt for the LLM arm.
     cfg.opro_prompt = bool(getattr(args, "opro_prompt", False))
@@ -371,6 +390,7 @@ async def run_motion_over_seeds(config: Config, seeds: List[int], llm_model: str
             allow_arch_changes=cfg.allow_arch_changes,
             semantic_repair=getattr(cfg, "semantic_repair", False),
             payload_motion=True,
+            motion_show_profile=not getattr(cfg, "motion_no_profile", False),
         )
         try:
             results = await run_motion_experiment(
@@ -379,6 +399,7 @@ async def run_motion_over_seeds(config: Config, seeds: List[int], llm_model: str
                 final_eval_seeds=fe_seeds,
                 run_id=1,
                 arms_to_run=tuple(arms_to_run),
+                search_seed=seed,
             )
             save_motion_results(results, cfg.output_dir, run_id=1)
             agent.save_protocol_log(str(cfg.output_dir / "motion_protocol_log_run1.json"))

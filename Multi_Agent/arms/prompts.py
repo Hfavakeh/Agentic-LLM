@@ -162,28 +162,36 @@ def format_motion_loss_payload(
     anchor_levers: Dict[str, Any],
     motion_profile: Dict[str, Any],
     anchor_regime_error: Any = None,
+    show_profile: bool = True,
 ) -> str:
     """Render the motion context for the loss-shaping LLM: raw motion summaries,
     the current levers, where error concentrates by regime, and the tried lever
     vectors with their scores (worst→best), so the LLM can reason quantitatively
-    and avoid repeats."""
+    and avoid repeats.
+
+    ``show_profile=False`` is the Email-7 control ablation: the MOTION SUMMARY
+    block (speed / acceleration / turning / stop-go interpretation of the
+    trajectory) is omitted, so the LLM sees only the per-regime error feedback,
+    not any motion interpretation. This isolates whether the motion *summary*
+    adds anything over the raw error signal."""
     mp = motion_profile or {}
     lines: List[str] = []
-    lines.append("== MOTION SUMMARY of the tracked person (raw numbers) ==")
-    lines.append(
-        f"  speed m/s: mean {_fmt_num(mp.get('speed_mean_mps'))}, median {_fmt_num(mp.get('speed_median_mps'))}, "
-        f"p95 {_fmt_num(mp.get('speed_p95_mps'))}, max {_fmt_num(mp.get('speed_max_mps'))}, std {_fmt_num(mp.get('speed_std_mps'))}")
-    lines.append(
-        f"  acceleration m/s^2: mean {_fmt_num(mp.get('accel_abs_mean_mps2'))}, p95 {_fmt_num(mp.get('accel_abs_p95_mps2'))}")
-    lines.append(
-        f"  turning: mean {_fmt_num(mp.get('turn_abs_mean_deg'))} deg/step, p95 {_fmt_num(mp.get('turn_abs_p95_deg'))} deg, "
-        f"sharp-turn share {_fmt_num(mp.get('sharp_turn_share'))}")
-    lines.append(
-        f"  roughness: path sinuosity {_fmt_num(mp.get('path_sinuosity'))} (1=straight), mean jerk {_fmt_num(mp.get('jerk_abs_mean_mps3'))} m/s^3")
-    dwell = mp.get("dwell", {}) or {}
-    lines.append(
-        f"  stop-go: stop share {_fmt_num(dwell.get('stop_share'))}, {_fmt_num(dwell.get('episodes_per_min'))} dwell episodes/min")
-    lines.append("")
+    if show_profile:
+        lines.append("== MOTION SUMMARY of the tracked person (raw numbers) ==")
+        lines.append(
+            f"  speed m/s: mean {_fmt_num(mp.get('speed_mean_mps'))}, median {_fmt_num(mp.get('speed_median_mps'))}, "
+            f"p95 {_fmt_num(mp.get('speed_p95_mps'))}, max {_fmt_num(mp.get('speed_max_mps'))}, std {_fmt_num(mp.get('speed_std_mps'))}")
+        lines.append(
+            f"  acceleration m/s^2: mean {_fmt_num(mp.get('accel_abs_mean_mps2'))}, p95 {_fmt_num(mp.get('accel_abs_p95_mps2'))}")
+        lines.append(
+            f"  turning: mean {_fmt_num(mp.get('turn_abs_mean_deg'))} deg/step, p95 {_fmt_num(mp.get('turn_abs_p95_deg'))} deg, "
+            f"sharp-turn share {_fmt_num(mp.get('sharp_turn_share'))}")
+        lines.append(
+            f"  roughness: path sinuosity {_fmt_num(mp.get('path_sinuosity'))} (1=straight), mean jerk {_fmt_num(mp.get('jerk_abs_mean_mps3'))} m/s^3")
+        dwell = mp.get("dwell", {}) or {}
+        lines.append(
+            f"  stop-go: stop share {_fmt_num(dwell.get('stop_share'))}, {_fmt_num(dwell.get('episodes_per_min'))} dwell episodes/min")
+        lines.append("")
 
     lines.append("== CURRENT LOSS-SHAPING LEVERS (propose changes relative to this) ==")
     lines.append("  " + ", ".join(f"{k}={_fmt_grid_val(anchor_levers.get(k))}" for k in _LEVER_ORDER))

@@ -205,6 +205,7 @@ async def run_motion_experiment(
     final_eval_seeds: List[int],
     run_id: int = 1,
     arms_to_run=("llm",),
+    search_seed: int = 2000,
 ) -> Dict[str, Any]:
     """Run the motion loss-shaping experiment for the selected arms, then
     final-evaluate each arm's chosen levers on fresh seeds.
@@ -227,7 +228,10 @@ async def run_motion_experiment(
         arms["motion_rule"] = _run_deterministic_arm(
             base_cfg, dataset, base_setting, heuristic_levers(motion_profile), "C2 (motion heuristic)")
     if "random" in arms_to_run:
-        arms["random"] = _run_random_arm(base_cfg, dataset, base_setting, n_attempts)
+        # Seed the random search off the outer search seed so multiple seeds give
+        # DIFFERENT random searches (a distribution to paired-test), not a repeat.
+        arms["random"] = _run_random_arm(base_cfg, dataset, base_setting, n_attempts,
+                                         seed=int(search_seed))
     if "llm" in arms_to_run:
         arms["llm"] = await _run_llm_arm(base_cfg, dataset, base_setting, llm_agent, n_attempts)
 

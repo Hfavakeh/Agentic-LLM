@@ -246,7 +246,8 @@ w_res: <0.0 to 1.0>
                  enable_motion: bool = True, semantic_repair: bool = False,
                  llm_timeout_s: float = 300.0, history_ablation: str = "none",
                  payload_curves: bool = False, explore_prompt: bool = False,
-                 payload_motion: bool = False, opro_prompt: bool = False):
+                 payload_motion: bool = False, opro_prompt: bool = False,
+                 motion_show_profile: bool = True):
 
         self.client = OllamaChatCompletionClient(
             model=model_name,
@@ -296,6 +297,7 @@ w_res: <0.0 to 1.0>
         # Q5: when True, the payload gains a MOTION PROFILE block and a per-setting
         # per-regime (slow/med/fast) error label, and the prompt explains them.
         self.payload_motion    = payload_motion
+        self.motion_show_profile = motion_show_profile
         # OPRO variant (Email-5): when True the LLM arm uses the OPRO meta-prompt
         # + raw (setting, score) trajectory payload instead of the qualitative
         # protocol prompt. Takes precedence over explore_prompt/payload_curves/
@@ -566,7 +568,8 @@ w_res: <0.0 to 1.0>
         motion_profile = context.get("motion_profile", {})
         regime_err = context.get("anchor_regime_error")
 
-        base_user = format_motion_loss_payload(history, anchor, motion_profile, regime_err)
+        base_user = format_motion_loss_payload(history, anchor, motion_profile, regime_err,
+                                               show_profile=self.motion_show_profile)
         feedback = ""
         last_reason = "unknown"
         last_parsed: Dict[str, Any] = {}
