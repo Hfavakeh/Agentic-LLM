@@ -38,12 +38,26 @@ def load_refs(refs_dir: Path):
             np.array(d["final_eval"]["motion_rule"]["per_seed"], dtype=float))
 
 
+def find_seed_runs(root: Path):
+    """One motion_experiment_run1.json per search seed, searched recursively so a
+    nested ``seed_N/seed_N/`` layout (a file-transfer artifact) is still found.
+    When a seed has several candidates, keep the most complete (largest) one."""
+    best_per_seed = {}
+    for f in sorted(root.rglob("motion_experiment_run1.json")):
+        seed = next((p for p in f.relative_to(root).parts if p.startswith("seed_")),
+                    str(f.parent))
+        cur = best_per_seed.get(seed)
+        if cur is None or f.stat().st_size > cur.stat().st_size:
+            best_per_seed[seed] = f
+    return [best_per_seed[k] for k in sorted(best_per_seed)]
+
+
 def load_llm(model_dir: Path, arm: str = "llm"):
     """Return (per_search_seed matrix [n_search, n_final], list of levers) for
     the named arm (``llm`` or ``random`` — both search the 6 knobs per seed)."""
     arrs, levers = [], []
-    for f in sorted(glob.glob(str(model_dir / "seed_*" / "motion_experiment_run1.json"))):
-        d = json.loads(Path(f).read_text(encoding="utf-8"))
+    for f in find_seed_runs(model_dir):
+        d = json.loads(f.read_text(encoding="utf-8"))
         arrs.append(d["final_eval"][arm]["per_seed"])
         best = d["arms"][arm].get("best_levers") or {}
         levers.append(tuple(sorted(best.items())))

@@ -58,8 +58,19 @@ LOSS_SHAPING_KEYS: Set[str] = {
 # lever so "no shaping" (plain MSE) is reachable: lambda_vel=0 / lambda_smooth=0
 # switch a penalty off, bin weights of 1.0 are neutral. `v_max` only bites when
 # lambda_vel > 0 (it is the plausible top human speed in m/s).
+#
+# v_max RANGE FIX (2026-07-16): the original grid floor was 1.0 m/s, but every
+# supported dataset is slow indoor walking — p95 speed is only 0.41 (cap) / 0.48
+# (IR) / 0.60 (radar) m/s. So the motion heuristic's `v_max = 1.1 x p95` (0.45 -
+# 0.65) always snapped to the 1.0 floor: the knob was a CONSTANT across datasets
+# and the velocity penalty almost never fired (it needs a predicted step > 1.0
+# m/s, i.e. >3x the mean speed). The LLM hit the same wall — it correctly
+# reasoned "set v_max to match p95 (0.6)" but could not express it. The range now
+# spans the data (0.5 - 2.0) so v_max can actually track the observed speed.
+# Kept at 5 values so the search-space size — and hence the random control's
+# difficulty — is unchanged.
 LOSS_SHAPING_GRID = {
-    "v_max":            [1.0, 1.5, 2.0, 2.5, 3.0],
+    "v_max":            [0.5, 0.75, 1.0, 1.5, 2.0],
     "lambda_vel":       [0.0, 0.05, 0.1, 0.2, 0.3],
     "lambda_smooth":    [0.0, 0.05, 0.1, 0.2, 0.3],
     "bin_weight_slow":  [0.5, 1.0, 1.5, 2.0, 3.0],
