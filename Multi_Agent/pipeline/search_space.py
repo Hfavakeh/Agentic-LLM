@@ -69,6 +69,17 @@ LOSS_SHAPING_KEYS: Set[str] = {
 # spans the data (0.5 - 2.0) so v_max can actually track the observed speed.
 # Kept at 5 values so the search-space size — and hence the random control's
 # difficulty — is unchanged.
+#
+# LAMBDA SEMANTICS CHANGED (2026-07-26). The two lambdas are now DIMENSIONLESS
+# weights on penalties normalised by the dataset's own reference kinematics
+# (`data.compute_motion_reference`), and the smoothness term finally carries its
+# f_s^2 factor, so it is a physical acceleration. The grid VALUES are unchanged
+# but their MEANING is not: lambda_smooth=0.1 used to be an essentially inert
+# term (~0.3% of the base loss at 4 Hz, and ~4x stronger on IR than on radar for
+# no physical reason), and now means "penalty ~0.1 when the prediction merely
+# reproduces the walker's own acceleration", i.e. comparable to the base loss.
+# Motion-experiment numbers produced before this date are NOT comparable to
+# numbers produced after it. See `Trainer._compute_total_loss` for the units.
 LOSS_SHAPING_GRID = {
     "v_max":            [0.5, 0.75, 1.0, 1.5, 2.0],
     "lambda_vel":       [0.0, 0.05, 0.1, 0.2, 0.3],

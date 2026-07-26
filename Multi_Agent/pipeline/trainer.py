@@ -32,13 +32,24 @@ from .model import LSTM_Localizer
 #   bin_weights   — per-speed-bin MSE weights [slow, medium, fast]
 #                   (None or all-equal = uniform = plain MSE).
 #   bin_edges     — speed thresholds (m/s) separating the bins; len == len(bin_weights) - 1.
+#
+# The last two entries are DATASET CONSTANTS, not controller levers: the RMS
+# speed / acceleration of the true training trajectory, used to normalise the
+# two priors so the lambdas are dimensionless and mean the same thing at 3, 4
+# and 5 Hz (see `_compute_total_loss`). They are filled in from the dataset
+# dict, like `bin_edges`, and no proposer may change them.
 DEFAULT_LOSS_SHAPING: Dict[str, Any] = {
-    "v_max":         2.0,
-    "lambda_vel":    0.0,
-    "lambda_smooth": 0.0,
-    "bin_weights":   None,
-    "bin_edges":     None,
+    "v_max":          2.0,
+    "lambda_vel":     0.0,
+    "lambda_smooth":  0.0,
+    "bin_weights":    None,
+    "bin_edges":      None,
+    "speed_ref_mps":  None,
+    "accel_ref_mps2": None,
 }
+
+# Loss-shaping entries owned by the dataset, refreshed on every rebuild.
+_DATASET_LOSS_SHAPING_KEYS = ("bin_edges", "speed_ref_mps", "accel_ref_mps2")
 
 
 class Trainer:
@@ -106,7 +117,8 @@ class Trainer:
         # `bin_edges` are fixed speed thresholds from the dataset (terciles of
         # training-set speed) — not controller-tunable.
         self.loss_shaping: Dict[str, Any] = dict(DEFAULT_LOSS_SHAPING)
-        self.loss_shaping["bin_edges"] = dataset_dict.get("bin_edges")
+        for _key in _DATASET_LOSS_SHAPING_KEYS:
+            self.loss_shaping[_key] = dataset_dict.get(_key)
 
     # ------------------------------------------------------------------
     # Convenience wrappers (used by the optimisation loops)
@@ -211,22 +223,42 @@ class Trainer:
             self.val_loader = val_loader
         if scaler_y is not None:
             self.scaler_y = scaler_y
-        # A window-size rebuild re-computes speeds, hence the speed-bin edges.
-        # Refresh them from the (in-place updated) dataset dict so the
-        # motion-weighted loss term keeps using correct thresholds.
-        if self.dataset_dict.get("bin_edges") is not None:
-            self.loss_shaping["bin_edges"] = self.dataset_dict["bin_edges"]
+        # A window-size rebuild re-fits the scaler and re-computes speeds, hence
+        # the speed-bin edges and the reference kinematics. Refresh them from
+        # the (in-place updated) dataset dict so the motion-weighted loss term
+        # keeps using correct thresholds and the priors keep their normalisation.
+        for key in _DATASET_LOSS_SHAPING_KEYS:
+            if self.dataset_dict.get(key) is not None:
+                self.loss_shaping[key] = self.dataset_dict[key]
 
     # ------------------------------------------------------------------
     # Core training / validation
     # ------------------------------------------------------------------
 
+    def _motion_reference(self, key: str) -> float:
+        """Dataset reference kinematic used to normalise a motion prior.
+
+        Fails loudly rather than silently mis-weighting the objective: a
+        missing reference means the Trainer was built from a dataset dict that
+        did not go through `DataProcessor.build_dataset`, and any penalty
+        computed without it would be off by orders of magnitude.
+        """
+        val = self.loss_shaping.get(key)
+        if val is None or not np.isfinite(val) or float(val) <= 0.0:
+            raise RuntimeError(
+                f"Motion-aware loss shaping is active but '{key}' is missing or "
+                f"non-positive ({val!r}). It is computed on the training split by "
+                f"pipeline.data.compute_motion_reference and must be present in the "
+                f"dataset dict; see Trainer._compute_total_loss for what it normalises."
+            )
+        return float(val)
+
     def _compute_total_loss(
         self,
         preds: torch.Tensor,
         targets: torch.Tensor,
-        prev_y: Optional[torch.Tensor] = None,
-        prev_prev_y: Optional[torch.Tensor] = None,
+        prev_pos: Optional[torch.Tensor] = None,
+        prev_prev_pos: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Position loss with optional motion-aware shaping.
 
@@ -235,18 +267,89 @@ class Trainer:
         plain MSE, so motion shaping is fully opt-in and baseline behaviour
         is unchanged until a controller sets non-default values.
 
-        Shaping terms (each opt-in, configured via `self.loss_shaping`):
-          * speed-bin-weighted MSE — per-sample MSE reweighted by the true
-            motion regime (slow / medium / fast) that the sample belongs to.
-          * velocity-plausibility prior — penalises predicted speeds above a
-            physical human ceiling `v_max` (m/s).
-          * smoothness prior — penalises implausible acceleration (jerk),
-            computed from the three consecutive points prev_prev -> prev -> pred.
+        NOTATION AND TENSOR SHAPES
+        --------------------------
+        B = batch size, D = target_dim = 2 (the x/y coordinates of one person).
+        The model input `X` is (B, window_size, n_features); every tensor
+        below is (B, D) unless stated otherwise:
 
-        Velocity and acceleration are evaluated in real-world metres by
-        un-scaling displacements with `scaler_y.scale_` (the StandardScaler
-        mean cancels for differences), so `v_max` is a genuine physical
-        quantity a controller can reason about.
+          preds          p̂_t      predicted position at time t
+          targets        p_t      ground-truth position at t
+          prev_pos       p_{t-1}  ground-truth position at t-1
+          prev_prev_pos  p_{t-2}  ground-truth position at t-2
+
+        ALL FOUR ARE STANDARDISED, not metres: every position is stored as
+        (p - mu) / sigma, where mu and sigma come from a `StandardScaler`
+        FITTED ON THE TRAINING SPLIT ONLY (`DataProcessor.scale_splits`).
+
+          sigma = `self.scaler_y.scale_`, shape (D,) — the per-coordinate
+          standard deviation of the training targets in the raw CSV
+          coordinate unit (metres). It is a fixed dataset constant, never
+          learned. Radar sigma = (0.804, 0.705) m, cap = (0.592, 0.535) m,
+          IR = (0.602, 0.585) m.
+
+        Because mu cancels in any difference of two positions, a standardised
+        displacement converts to metres exactly by an element-wise multiply:
+
+              (a - b)_metres = (a - b)_standardised * sigma
+
+          f_s = `self.config.hz` — the dataset sampling rate (radar 4, cap 3,
+          IR 5 Hz). Consecutive rows are one sample apart, so one sample step
+          is 1 / f_s seconds.
+
+        PHYSICAL QUANTITIES (per sample, SI units)
+        ------------------------------------------
+          speed         v̂_t = || (p̂_t - p_{t-1}) * sigma ||  * f_s        [m/s]
+          acceleration  â_t =  (p̂_t - 2 p_{t-1} + p_{t-2}) * sigma * f_s^2 [m/s^2]
+
+        The second finite difference is only PROPORTIONAL to acceleration; the
+        f_s^2 factor is what makes it a physical acceleration. It was missing
+        before 2026-07-26, which made `lambda_smooth` mean a different physical
+        strength on every dataset — see the normalisation note below.
+
+        Both kinematic quantities mix the current PREDICTION with one or two
+        previous GROUND-TRUTH positions, so these are one-step,
+        ground-truth-anchored (teacher-forced) kinematic penalties, not
+        penalties on a freely rolled-out predicted trajectory. Consequence for
+        the acceleration term: it is minimised by p̂_t = 2 p_{t-1} - p_{t-2},
+        the constant-velocity extrapolation, so it does not vanish at the true
+        target — it carries a non-zero floor equal to the walker's own
+        acceleration and biases predictions toward straight-line motion. The
+        velocity term has no such floor because it is a hinge: it is exactly
+        zero for any predicted step slower than `v_max`.
+
+        LOSS TERMS AND THEIR UNITS
+        --------------------------
+          base position loss   mean over D of (p̂ - p)^2, in standardised
+                               units — dimensionless. Optionally reweighted
+                               per sample by the TRUE speed regime
+                               (slow/medium/fast) via `bin_weights`; the
+                               weights are normalised to sum to 1, so a
+                               uniform weight vector leaves it unchanged.
+          velocity penalty     mean(relu(v̂ - v_max)^2) / v_ref^2   [-]
+          smoothness penalty   mean(||â||^2)           / a_ref^2   [-]
+
+        CROSS-DATASET NORMALISATION. Each physical penalty is divided by the
+        matching REFERENCE KINEMATIC of the dataset, computed once on the
+        TRAINING SPLIT ONLY (`data.compute_motion_reference`, alongside the
+        speed-bin edges) from the ground-truth trajectory:
+
+              v_ref = sqrt(mean(v_true^2))   [m/s]     RMS step speed
+              a_ref = sqrt(mean(||a_true||^2)) [m/s^2] RMS acceleration
+
+        Both penalties are therefore DIMENSIONLESS ratios, and so are
+        `lambda_vel` and `lambda_smooth`: a given lambda buys the same
+        penalty strength relative to the walker's own motion whether the
+        data is capacitive (3 Hz), radar (4 Hz) or IR (5 Hz). Without this
+        the same `lambda_smooth` was ~4x stronger on IR than on radar purely
+        because of f_s and the walker's acceleration content. Their grids
+        live in `search_space.LOSS_SHAPING_GRID`.
+
+        Scale check: the smoothness penalty equals ~1.0 when the prediction
+        reproduces the walker's own acceleration, so `lambda_smooth` reads
+        directly as "penalty at the natural-motion floor, relative to a base
+        loss of ~0.09-0.17 at the RMSE this model achieves" — i.e. the grid
+        spans negligible (0.05) to dominant (0.3) by design.
 
         Returns (total_loss, position_mse): `total_loss` is the shaped
         objective used for back-prop; `position_mse` is the plain unweighted
@@ -258,17 +361,20 @@ class Trainer:
         position_mse = per_sample_mse.mean()                            # plain MSE
 
         def _scale_y() -> torch.Tensor:
+            """sigma — per-coordinate std of the train targets, in metres. (D,)"""
             return torch.as_tensor(
                 self.scaler_y.scale_, dtype=preds.dtype, device=preds.device,
             )
 
+        f_s = float(self.config.hz)
+
         # ── Base position loss (optionally speed-bin weighted) ──
         bin_weights = ls.get("bin_weights")
         bin_edges   = ls.get("bin_edges")
-        if (bin_weights and bin_edges and prev_y is not None
+        if (bin_weights and bin_edges and prev_pos is not None
                 and len(set(bin_weights)) > 1):
-            true_speed = (((targets - prev_y) * _scale_y()).norm(dim=1)
-                          * float(self.config.hz))                       # (B,) m/s
+            true_speed = (((targets - prev_pos) * _scale_y()).norm(dim=1)
+                          * f_s)                                         # (B,) m/s
             edges = torch.as_tensor(bin_edges, dtype=preds.dtype, device=preds.device)
             bin_idx = torch.bucketize(true_speed, edges).clamp(max=len(bin_weights) - 1)
             w = torch.as_tensor(bin_weights, dtype=preds.dtype, device=preds.device)
@@ -281,17 +387,21 @@ class Trainer:
 
         # ── Velocity-plausibility prior ──
         lam_vel = float(ls.get("lambda_vel", 0.0) or 0.0)
-        if lam_vel > 0.0 and prev_y is not None:
-            pred_speed = (((preds - prev_y) * _scale_y()).norm(dim=1)
-                          * float(self.config.hz))                       # (B,) m/s
+        if lam_vel > 0.0 and prev_pos is not None:
+            pred_speed = (((preds - prev_pos) * _scale_y()).norm(dim=1)
+                          * f_s)                                         # (B,) m/s
             v_max = float(ls.get("v_max", 2.0))
-            total = total + lam_vel * torch.relu(pred_speed - v_max).pow(2).mean()
+            excess = torch.relu(pred_speed - v_max)                      # (B,) m/s
+            v_ref = self._motion_reference("speed_ref_mps")              # m/s
+            total = total + lam_vel * excess.pow(2).mean() / (v_ref ** 2)
 
         # ── Smoothness / acceleration prior ──
         lam_sm = float(ls.get("lambda_smooth", 0.0) or 0.0)
-        if lam_sm > 0.0 and prev_y is not None and prev_prev_y is not None:
-            accel = ((preds - prev_y) - (prev_y - prev_prev_y)) * _scale_y()
-            total = total + lam_sm * accel.pow(2).sum(dim=1).mean()
+        if lam_sm > 0.0 and prev_pos is not None and prev_prev_pos is not None:
+            accel = ((preds - 2.0 * prev_pos + prev_prev_pos)
+                     * _scale_y() * (f_s ** 2))                          # (B, D) m/s^2
+            a_ref = self._motion_reference("accel_ref_mps2")             # m/s^2
+            total = total + lam_sm * accel.pow(2).sum(dim=1).mean() / (a_ref ** 2)
 
         return (total, position_mse)
 
@@ -302,13 +412,13 @@ class Trainer:
         for batch in loader:
             X_batch = batch["X"].to(self.config.device)
             y_batch = batch["y"].to(self.config.device)
-            prev_y = (batch["prev_y"].to(self.config.device)
-                      if "prev_y" in batch else None)
-            prev_prev_y = (batch["prev_prev_y"].to(self.config.device)
-                           if "prev_prev_y" in batch else None)
+            prev_pos = (batch["prev_pos"].to(self.config.device)
+                      if "prev_pos" in batch else None)
+            prev_prev_pos = (batch["prev_prev_pos"].to(self.config.device)
+                           if "prev_prev_pos" in batch else None)
             self.optimizer.zero_grad()
             preds = self.model(X_batch)
-            (loss, _pos_mse) = self._compute_total_loss(preds, y_batch, prev_y, prev_prev_y)
+            (loss, _pos_mse) = self._compute_total_loss(preds, y_batch, prev_pos, prev_prev_pos)
             if not torch.isfinite(loss):
                 logger.error("Non-finite loss — aborting epoch.")
                 return float("nan"), float("nan")
@@ -333,12 +443,12 @@ class Trainer:
             for batch in loader:
                 X_batch = batch["X"].to(self.config.device)
                 y_batch = batch["y"].to(self.config.device)
-                prev_y = (batch["prev_y"].to(self.config.device)
-                          if "prev_y" in batch else None)
-                prev_prev_y = (batch["prev_prev_y"].to(self.config.device)
-                               if "prev_prev_y" in batch else None)
+                prev_pos = (batch["prev_pos"].to(self.config.device)
+                          if "prev_pos" in batch else None)
+                prev_prev_pos = (batch["prev_prev_pos"].to(self.config.device)
+                               if "prev_prev_pos" in batch else None)
                 preds = self.model(X_batch)
-                (loss, pos_mse) = self._compute_total_loss(preds, y_batch, prev_y, prev_prev_y)
+                (loss, pos_mse) = self._compute_total_loss(preds, y_batch, prev_pos, prev_prev_pos)
                 if not torch.isfinite(loss):
                     logger.error("Non-finite validation loss.")
                     self._cached_val_distance_m = None

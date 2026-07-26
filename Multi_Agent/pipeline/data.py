@@ -20,17 +20,17 @@ class TimeSeriesDataset(Dataset):
         self,
         X: np.ndarray,
         y: np.ndarray,
-        prev_y: Optional[np.ndarray] = None,
-        prev_prev_y: Optional[np.ndarray] = None,
+        prev_pos: Optional[np.ndarray] = None,
+        prev_prev_pos: Optional[np.ndarray] = None,
     ):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
-        self.prev_y = (
-            torch.tensor(prev_y, dtype=torch.float32) if prev_y is not None else None
+        self.prev_pos = (
+            torch.tensor(prev_pos, dtype=torch.float32) if prev_pos is not None else None
         )
-        self.prev_prev_y = (
-            torch.tensor(prev_prev_y, dtype=torch.float32)
-            if prev_prev_y is not None else None
+        self.prev_prev_pos = (
+            torch.tensor(prev_prev_pos, dtype=torch.float32)
+            if prev_prev_pos is not None else None
         )
 
     def __len__(self):
@@ -38,16 +38,16 @@ class TimeSeriesDataset(Dataset):
 
     def __getitem__(self, idx):
         item = {"X": self.X[idx], "y": self.y[idx]}
-        if self.prev_y is not None:
-            item["prev_y"] = self.prev_y[idx]
-        if self.prev_prev_y is not None:
-            item["prev_prev_y"] = self.prev_prev_y[idx]
+        if self.prev_pos is not None:
+            item["prev_pos"] = self.prev_pos[idx]
+        if self.prev_prev_pos is not None:
+            item["prev_prev_pos"] = self.prev_prev_pos[idx]
         return item
 
 
 def compute_speed_bin_edges(
     y_scaled: np.ndarray,
-    prev_y_scaled: np.ndarray,
+    prev_pos_scaled: np.ndarray,
     scaler_y: StandardScaler,
     hz: float,
 ) -> List[float]:
@@ -59,12 +59,42 @@ def compute_speed_bin_edges(
     un-scaled to real metres (the StandardScaler mean cancels for a
     difference) so the thresholds are genuine m/s.
     """
-    disp  = (np.asarray(y_scaled) - np.asarray(prev_y_scaled)) * scaler_y.scale_
+    disp  = (np.asarray(y_scaled) - np.asarray(prev_pos_scaled)) * scaler_y.scale_
     speed = np.linalg.norm(disp, axis=1) * float(hz)
     return [
         float(np.quantile(speed, 1.0 / 3.0)),
         float(np.quantile(speed, 2.0 / 3.0)),
     ]
+
+
+def compute_motion_reference(
+    y_scaled: np.ndarray,
+    prev_pos_scaled: np.ndarray,
+    prev_prev_pos_scaled: np.ndarray,
+    scaler_y: StandardScaler,
+    hz: float,
+) -> Dict[str, float]:
+    """Reference kinematics of the TRUE trajectory, from a scaled train split.
+
+    Returns the RMS step speed (m/s) and RMS acceleration (m/s^2) of the
+    ground-truth positions. `Trainer._compute_total_loss` divides the velocity
+    and smoothness penalties by these, which is what makes `lambda_vel` and
+    `lambda_smooth` dimensionless and comparable across the 3 / 4 / 5 Hz
+    datasets — see that docstring for the full unit derivation.
+
+    RMS (not mean) because both penalties are squared quantities: the
+    smoothness penalty is then ~1.0 when the prediction merely reproduces the
+    walker's own acceleration. Computed on train only, like `bin_edges`.
+    """
+    sigma = scaler_y.scale_
+    step  = (np.asarray(y_scaled) - np.asarray(prev_pos_scaled)) * sigma      # metres
+    accel = ((np.asarray(y_scaled) - 2.0 * np.asarray(prev_pos_scaled)
+              + np.asarray(prev_prev_pos_scaled)) * sigma) * float(hz) ** 2   # m/s^2
+    speed = np.linalg.norm(step, axis=1) * float(hz)                          # m/s
+    return {
+        "speed_ref_mps":  float(np.sqrt(np.mean(speed ** 2))),
+        "accel_ref_mps2": float(np.sqrt(np.mean(np.sum(accel ** 2, axis=1)))),
+    }
 
 
 class DataProcessor:
@@ -91,25 +121,25 @@ class DataProcessor:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Sliding-window sequences from a single contiguous split.
 
-        Returns (seq_X, seq_y, seq_prev_y, seq_prev_prev_y). `seq_prev_y` and
-        `seq_prev_prev_y` are the two positions immediately preceding each
+        Returns (seq_X, seq_y, seq_prev_pos, seq_prev_prev_pos). `seq_prev_pos` and
+        `seq_prev_prev_pos` are the two positions immediately preceding each
         target — three consecutive points (prev_prev -> prev -> target) are
         what the LLM-proposed smoothness/acceleration prior needs.
         """
         n = len(X) - self.config.window_size
         seq_X = [X[i : i + self.config.window_size] for i in range(n)]
         seq_y = [y[i + self.config.window_size]     for i in range(n)]
-        seq_prev_y      = [y[i + self.config.window_size - 1] for i in range(n)]
-        seq_prev_prev_y = [y[i + self.config.window_size - 2] for i in range(n)]
+        seq_prev_pos      = [y[i + self.config.window_size - 1] for i in range(n)]
+        seq_prev_prev_pos = [y[i + self.config.window_size - 2] for i in range(n)]
         seq_X = np.asarray(seq_X, dtype=np.float32)
         seq_y = np.asarray(seq_y, dtype=np.float32)
-        seq_prev_y      = np.asarray(seq_prev_y, dtype=np.float32)
-        seq_prev_prev_y = np.asarray(seq_prev_prev_y, dtype=np.float32)
+        seq_prev_pos      = np.asarray(seq_prev_pos, dtype=np.float32)
+        seq_prev_prev_pos = np.asarray(seq_prev_prev_pos, dtype=np.float32)
         logger.info(
             "Sequences: %d | Input: %s | Target: %s | Prev: %s | Prev2: %s",
-            len(seq_X), seq_X.shape, seq_y.shape, seq_prev_y.shape, seq_prev_prev_y.shape,
+            len(seq_X), seq_X.shape, seq_y.shape, seq_prev_pos.shape, seq_prev_prev_pos.shape,
         )
-        return seq_X, seq_y, seq_prev_y, seq_prev_prev_y
+        return seq_X, seq_y, seq_prev_pos, seq_prev_prev_pos
 
     def temporal_split(self, X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, ...]:
         spec = get_dataset_spec(self.config.csv_path)
@@ -163,30 +193,35 @@ class DataProcessor:
         # Split raw data BEFORE windowing to prevent leakage across splits
         rX_tr, rX_val, rX_te, ry_tr, ry_val, ry_te = proc.temporal_split(X, y)
         # Window each split independently
-        X_tr, y_tr, prev_y_tr, prev2_y_tr    = proc.create_sequences(rX_tr, ry_tr)
-        X_val, y_val, prev_y_val, prev2_y_val = proc.create_sequences(rX_val, ry_val)
-        X_te, y_te, prev_y_te, prev2_y_te    = proc.create_sequences(rX_te, ry_te)
+        X_tr, y_tr, prev_pos_tr, prev2_pos_tr    = proc.create_sequences(rX_tr, ry_tr)
+        X_val, y_val, prev_pos_val, prev2_pos_val = proc.create_sequences(rX_val, ry_val)
+        X_te, y_te, prev_pos_te, prev2_pos_te    = proc.create_sequences(rX_te, ry_te)
         X_tr, X_val, X_te, y_tr, y_val, y_te = proc.scale_splits(
             X_tr, X_val, X_te, y_tr, y_val, y_te
         )
-        prev_y_tr = proc.scaler_y.transform(prev_y_tr)
-        prev_y_val = proc.scaler_y.transform(prev_y_val)
-        prev_y_te = proc.scaler_y.transform(prev_y_te)
-        prev2_y_tr = proc.scaler_y.transform(prev2_y_tr)
-        prev2_y_val = proc.scaler_y.transform(prev2_y_val)
-        prev2_y_te = proc.scaler_y.transform(prev2_y_te)
-        bin_edges = compute_speed_bin_edges(y_tr, prev_y_tr, proc.scaler_y, config.hz)
+        prev_pos_tr = proc.scaler_y.transform(prev_pos_tr)
+        prev_pos_val = proc.scaler_y.transform(prev_pos_val)
+        prev_pos_te = proc.scaler_y.transform(prev_pos_te)
+        prev2_pos_tr = proc.scaler_y.transform(prev2_pos_tr)
+        prev2_pos_val = proc.scaler_y.transform(prev2_pos_val)
+        prev2_pos_te = proc.scaler_y.transform(prev2_pos_te)
+        bin_edges = compute_speed_bin_edges(y_tr, prev_pos_tr, proc.scaler_y, config.hz)
+        motion_ref = compute_motion_reference(
+            y_tr, prev_pos_tr, prev2_pos_tr, proc.scaler_y, config.hz
+        )
         return {
             "X_train": X_tr, "y_train": y_tr,
             "X_val":   X_val, "y_val":  y_val,
             "X_test":  X_te,  "y_test": y_te,
-            "prev_y_train": prev_y_tr,
-            "prev_y_val": prev_y_val,
-            "prev_y_test": prev_y_te,
-            "prev_prev_y_train": prev2_y_tr,
-            "prev_prev_y_val":   prev2_y_val,
-            "prev_prev_y_test":  prev2_y_te,
+            "prev_pos_train": prev_pos_tr,
+            "prev_pos_val": prev_pos_val,
+            "prev_pos_test": prev_pos_te,
+            "prev_prev_pos_train": prev2_pos_tr,
+            "prev_prev_pos_val":   prev2_pos_val,
+            "prev_prev_pos_test":  prev2_pos_te,
             "bin_edges": bin_edges,
+            "speed_ref_mps":  motion_ref["speed_ref_mps"],
+            "accel_ref_mps2": motion_ref["accel_ref_mps2"],
             "input_dim":  X_tr.shape[-1],
             "target_dim": y_tr.shape[-1],
             "processor":  proc,
@@ -209,30 +244,35 @@ class DataProcessor:
         # Re-create fresh scalers to avoid contamination from the old window size.
         proc.scaler_X = StandardScaler()
         proc.scaler_y = StandardScaler()
-        X_tr, y_tr, prev_y_tr, prev2_y_tr    = proc.create_sequences(dataset["raw_X_train"], dataset["raw_y_train"])
-        X_val, y_val, prev_y_val, prev2_y_val = proc.create_sequences(dataset["raw_X_val"],   dataset["raw_y_val"])
-        X_te, y_te, prev_y_te, prev2_y_te    = proc.create_sequences(dataset["raw_X_test"],  dataset["raw_y_test"])
+        X_tr, y_tr, prev_pos_tr, prev2_pos_tr    = proc.create_sequences(dataset["raw_X_train"], dataset["raw_y_train"])
+        X_val, y_val, prev_pos_val, prev2_pos_val = proc.create_sequences(dataset["raw_X_val"],   dataset["raw_y_val"])
+        X_te, y_te, prev_pos_te, prev2_pos_te    = proc.create_sequences(dataset["raw_X_test"],  dataset["raw_y_test"])
         X_tr, X_val, X_te, y_tr, y_val, y_te = proc.scale_splits(
             X_tr, X_val, X_te, y_tr, y_val, y_te
         )
-        prev_y_tr = proc.scaler_y.transform(prev_y_tr)
-        prev_y_val = proc.scaler_y.transform(prev_y_val)
-        prev_y_te = proc.scaler_y.transform(prev_y_te)
-        prev2_y_tr = proc.scaler_y.transform(prev2_y_tr)
-        prev2_y_val = proc.scaler_y.transform(prev2_y_val)
-        prev2_y_te = proc.scaler_y.transform(prev2_y_te)
-        bin_edges = compute_speed_bin_edges(y_tr, prev_y_tr, proc.scaler_y, proc.config.hz)
+        prev_pos_tr = proc.scaler_y.transform(prev_pos_tr)
+        prev_pos_val = proc.scaler_y.transform(prev_pos_val)
+        prev_pos_te = proc.scaler_y.transform(prev_pos_te)
+        prev2_pos_tr = proc.scaler_y.transform(prev2_pos_tr)
+        prev2_pos_val = proc.scaler_y.transform(prev2_pos_val)
+        prev2_pos_te = proc.scaler_y.transform(prev2_pos_te)
+        bin_edges = compute_speed_bin_edges(y_tr, prev_pos_tr, proc.scaler_y, proc.config.hz)
+        motion_ref = compute_motion_reference(
+            y_tr, prev_pos_tr, prev2_pos_tr, proc.scaler_y, proc.config.hz
+        )
         dataset.update({
             "X_train": X_tr, "y_train": y_tr,
             "X_val":   X_val, "y_val":  y_val,
             "X_test":  X_te,  "y_test": y_te,
-            "prev_y_train": prev_y_tr,
-            "prev_y_val": prev_y_val,
-            "prev_y_test": prev_y_te,
-            "prev_prev_y_train": prev2_y_tr,
-            "prev_prev_y_val":   prev2_y_val,
-            "prev_prev_y_test":  prev2_y_te,
+            "prev_pos_train": prev_pos_tr,
+            "prev_pos_val": prev_pos_val,
+            "prev_pos_test": prev_pos_te,
+            "prev_prev_pos_train": prev2_pos_tr,
+            "prev_prev_pos_val":   prev2_pos_val,
+            "prev_prev_pos_test":  prev2_pos_te,
             "bin_edges": bin_edges,
+            "speed_ref_mps":  motion_ref["speed_ref_mps"],
+            "accel_ref_mps2": motion_ref["accel_ref_mps2"],
             "input_dim":  X_tr.shape[-1],
             "target_dim": y_tr.shape[-1],
         })

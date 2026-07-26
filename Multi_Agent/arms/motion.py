@@ -61,7 +61,9 @@ def heuristic_levers(motion_profile: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "v_max":             v_max,
         "lambda_vel":        _snap("lambda_vel", 0.1),
-        "lambda_smooth":     _snap("lambda_smooth", 0.1),
+        # 0.05, not 0.1 — mirrors MotionAwareRuleBasedOptimizer._LAMBDA_SMOOTH
+        # after the 2026-07-26 unit fix (see that constant).
+        "lambda_smooth":     _snap("lambda_smooth", 0.05),
         "bin_weight_slow":   1.0,
         "bin_weight_medium": 1.0,
         "bin_weight_fast":   _snap("bin_weight_fast", 1.5),

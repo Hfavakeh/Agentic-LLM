@@ -47,6 +47,33 @@ _OUTCOME_KEYS = (
 )
 
 
+def _history_snapshot(h: Dict[str, Any]) -> Dict[str, Any]:
+    """Full-fidelity record of ONE past attempt as it existed when the prompt was
+    built (Email-8 instrumentation).
+
+    Deliberately keeps every raw number the payload converts to a label —
+    including `per_seed` (the three individual seed scores) and `val_rmse_std`
+    (their spread). The prompt shows only qualitative labels, so the diff
+    between this snapshot and `rendered_payload` IS the answer to "what
+    numerical information is retained or discarded"; see
+    `scripts/dump_llm_prompts.py`.
+    """
+    return {
+        "attempt":            h.get("attempt"),
+        "setting":            h.get("setting"),
+        "score":              h.get("score"),
+        "val_rmse_std":       h.get("val_rmse_std"),
+        "per_seed":           h.get("per_seed"),
+        "mean_best_epoch":    h.get("mean_best_epoch"),
+        "mean_val_loss":      h.get("mean_val_loss"),
+        "mean_train_val_gap": h.get("mean_train_val_gap"),
+        "changes_from_anchor": h.get("changes_from_anchor"),
+        "diagnosis":          h.get("diagnosis"),
+        "output_status":      h.get("output_status"),
+        "trained":            h.get("trained"),
+    }
+
+
 def _apply_history_ablation(history: List[Dict[str, Any]], mode: str,
                             rng: random.Random) -> List[Dict[str, Any]]:
     """Q3 history-use placebo: return a perturbed COPY of the rendered history.
@@ -284,6 +311,15 @@ w_res: <0.0 to 1.0>
         # anchor, and a history snapshot — the data needed to test whether the
         # LLM uses history. `_ablation_rng` is fixed-seeded so the "shuffled"
         # placebo is reproducible within a run.
+        #
+        # Email-8 (2026-07-26) extends each entry to a COMPLETE record of what
+        # the LLM received: the verbatim system prompt, the verbatim user
+        # message of every sub-attempt (retry feedback included), and the FULL
+        # numeric history that was available at that point — including the
+        # per-seed scores and their spread. The payload renders history as
+        # qualitative labels, so this snapshot is the ground truth for auditing
+        # which numbers were retained and which were discarded;
+        # `scripts/dump_llm_prompts.py` produces that audit.
         self.history_ablation  = history_ablation
         self._ablation_rng     = random.Random(12345)
         self.protocol_log: List[Dict[str, Any]] = []
@@ -375,11 +411,33 @@ w_res: <0.0 to 1.0>
             json.dump(self.conversation_log, f, indent=2, default=str)
         logger.info("Conversation log saved -> %s  (%d rounds)", path, len(self.conversation_log))
 
+    def _prompt_variant(self) -> str:
+        """Short label for the prompt/payload configuration actually in force.
+
+        The prompt and the input representation are experimental variables
+        (Email-8), so every transcript records which variant produced it rather
+        than leaving it to be inferred from the CLI flags.
+        """
+        if self.opro_prompt:
+            return "opro"
+        parts = ["protocol"]
+        if self.explore_prompt:
+            parts.append("explore")
+        if self.payload_curves:
+            parts.append("curves")
+        if self.payload_motion:
+            parts.append("motion")
+        if self.history_ablation not in ("none", None):
+            parts.append(f"history_{self.history_ablation}")
+        return "+".join(parts)
+
     def save_protocol_log(self, path: str = "protocol_log.json"):
         """Persist the protocol-path transcript (Step 0): per proposer call, the
-        exact rendered payload, raw replies, parsed proposal, anchor, history
-        snapshot, and the active history_ablation mode. This is the evidence
-        base for the Q3 history-use analysis."""
+        verbatim system prompt and user message(s), the exact rendered payload,
+        raw replies, parsed proposal, anchor, full-fidelity history snapshot,
+        and the active prompt variant / history_ablation mode. This is the
+        evidence base for the Q3 history-use analysis and for the Email-8
+        prompt-information audit (`scripts/dump_llm_prompts.py`)."""
         with open(path, "w") as f:
             json.dump(self.protocol_log, f, indent=2, default=str)
         logger.info("Protocol log saved -> %s  (%d calls)", path, len(self.protocol_log))
@@ -456,13 +514,16 @@ w_res: <0.0 to 1.0>
             "attempt_index":    len(self.protocol_log) + 1,
             "history_ablation": self.history_ablation,
             "opro_prompt":      self.opro_prompt,
+            "prompt_variant":   self._prompt_variant(),
             "anchor":           dict(anchor),
             "n_history":        len(history),
-            "history_snapshot": [
-                {"attempt": h.get("attempt"), "setting": h.get("setting"),
-                 "score": h.get("score"), "output_status": h.get("output_status")}
-                for h in history
-            ],
+            "history_snapshot": [_history_snapshot(h) for h in history],
+            "rendered_history_snapshot": (
+                [_history_snapshot(h) for h in rendered_history]
+                if self.history_ablation not in ("none", None) else None
+            ),
+            # Verbatim, exactly as sent to the model.
+            "system_prompt":    self._protocol_prompt,
             "rendered_payload": base_user,
             "sub_attempts":     [],
             "outcome":          "pending",
@@ -480,8 +541,8 @@ w_res: <0.0 to 1.0>
                 base_user + f"\n\nYOUR PREVIOUS REPLY WAS REJECTED: {feedback}\n"
                 "Reply again, in the exact format, with a different valid change."
             )
-            sub: Dict[str, Any] = {"attempt": attempt, "raw": None,
-                                   "parsed_changes": None, "status": None}
+            sub: Dict[str, Any] = {"attempt": attempt, "user_message": user_text,
+                                   "raw": None, "parsed_changes": None, "status": None}
             raw, err = await self._protocol_raw_call(self._protocol_prompt, user_text)
             if err:
                 last_reason = err
@@ -579,8 +640,13 @@ w_res: <0.0 to 1.0>
             "timestamp":        datetime.now().isoformat(),
             "attempt_index":    len(self.protocol_log) + 1,
             "mode":             "motion_loss_shaping",
+            "prompt_variant":   "motion_loss" + ("" if self.motion_show_profile else "+no_profile"),
             "anchor_levers":    dict(anchor),
             "n_history":        len(history),
+            "history_snapshot": [_history_snapshot(h) for h in history],
+            "motion_profile":   dict(motion_profile or {}),
+            # Verbatim, exactly as sent to the model.
+            "system_prompt":    self._motion_prompt,
             "rendered_payload": base_user,
             "sub_attempts":     [],
             "outcome":          "pending",
@@ -597,7 +663,8 @@ w_res: <0.0 to 1.0>
             user_text = base_user if not feedback else (
                 base_user + f"\n\nYOUR PREVIOUS REPLY WAS REJECTED: {feedback}\n"
                 "Reply again, in the exact format, with a different valid lever vector.")
-            sub: Dict[str, Any] = {"attempt": attempt, "raw": None, "parsed_changes": None, "status": None}
+            sub: Dict[str, Any] = {"attempt": attempt, "user_message": user_text,
+                                   "raw": None, "parsed_changes": None, "status": None}
             raw, err = await self._protocol_raw_call(self._motion_prompt, user_text)
             if err:
                 last_reason = err

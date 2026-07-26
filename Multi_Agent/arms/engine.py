@@ -87,29 +87,29 @@ def _default_setting(cfg: Config, allow_arch: bool) -> Dict[str, Any]:
 
 def make_loaders(dataset: Dict, batch_size: int):
     """Build train / val / test DataLoaders from the dataset dict."""
-    def _loader(X, y, prev_y, prev_prev_y, shuffle):
+    def _loader(X, y, prev_pos, prev_prev_pos, shuffle):
         return DataLoader(
-            TimeSeriesDataset(X, y, prev_y=prev_y, prev_prev_y=prev_prev_y),
+            TimeSeriesDataset(X, y, prev_pos=prev_pos, prev_prev_pos=prev_prev_pos),
             batch_size=batch_size,
             shuffle=shuffle,
         )
     return (
         _loader(
             dataset["X_train"], dataset["y_train"],
-            dataset.get("prev_y_train"),
-            dataset.get("prev_prev_y_train"),
+            dataset.get("prev_pos_train"),
+            dataset.get("prev_prev_pos_train"),
             shuffle=True,
         ),
         _loader(
             dataset["X_val"], dataset["y_val"],
-            dataset.get("prev_y_val"),
-            dataset.get("prev_prev_y_val"),
+            dataset.get("prev_pos_val"),
+            dataset.get("prev_prev_pos_val"),
             shuffle=False,
         ),
         _loader(
             dataset["X_test"], dataset["y_test"],
-            dataset.get("prev_y_test"),
-            dataset.get("prev_prev_y_test"),
+            dataset.get("prev_pos_test"),
+            dataset.get("prev_prev_pos_test"),
             shuffle=False,
         ),
     )

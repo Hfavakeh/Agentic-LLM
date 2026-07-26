@@ -30,17 +30,65 @@ python main.py --no-motion         # disable motion-aware MSE, diagnostics, prom
 python main.py --final-eval-seeds 30   # fresh seeds for the headline result (default 30)
 python main.py --no-final-eval         # search + reports only, skip final eval
 
-# Offline analysis utilities (each is standalone, --help for flags)
-python analyze_logs.py --root . --out analysis
-python statistical_analysis.py --dir .                  # builds llm_report.html
-python build_transcripts.py --root outputs-XXXX         # per-seed transcripts
+# Offline analysis utilities (now under scripts/; each is standalone, --help for flags)
+python scripts/analyze_logs.py --root results --out analysis
+python scripts/statistical_analysis.py --dir results   # builds llm_report.html
+python scripts/build_transcripts.py --root results/<group>/outputs-XXXX
 python motion_descriptors.py --csv preprocessed-RadarEXP1(in).csv --out analysis/motion
+
+# Prompt-quality / information-content audit (Email-8): verbatim transcript of
+# what the LLM received at every attempt + which numbers the payload discarded
+python scripts/dump_llm_prompts.py --run results/history-use/history-none-qwen3 --seed 42
 
 # Word/HTML report generation requires a Node install with `docx` at:
 #   C:/Users/hfava/AppData/Roaming/npm/node_modules
-node build_report_docx.js
-node build_transcripts_docx.js
+node scripts/report_builders/build_report_docx.js
+node scripts/report_builders/build_transcripts_docx.js
 ```
+
+## Repository layout (post-reorganization)
+
+See `README.md` for the full folder map. In short: runnable code and the three
+`preprocessed-*.csv` datasets stay at the repo root (the CSVs are referenced by
+bare filename in `pipeline/config.py`, so they must not move); offline analysis
+scripts live in `scripts/`; experiment output dirs are grouped under `results/`
+(`motion/`, `history-use/`, `curve-summaries/`, `prompt-ablation/`,
+`repair-ablation/`, `motion-knowledge/`, `cloud-models/`, `baseline/`,
+`archive/`); written deliverables are in `reports/`; the archived run logs are
+in `logs/YYYY-MM/`. `_attic/MOVES.csv` records every relocation and rename so
+any of them can be reversed.
+
+Groups are named for the question they answer, not the email thread they came
+from: the old `q2-curves` / `q3-history` / `point3` are now `curve-summaries` /
+`history-use` / `motion-knowledge`, and the matching scripts are
+`analyze_curve_summaries.py`, `analyze_history_ablation.py`,
+`analyze_exploration.py` (Q4) and `analyze_llm_behavior_deep.py`. Run dirs
+inside the groups no longer carry the redundant `outputs-` prefix.
+
+Those question-scripts hardcode which run dirs form each condition (`PAIRS`,
+`MODEL_FOLDERS`, `EXPLORE_FOLDERS`, or the `history-{cond}-{tag}` pattern), so
+renaming a run dir requires updating the map in the same commit — a stale name
+yields an empty condition, not an error. Each takes `--root`, defaulting to the
+repo's `results/`.
+
+Scripts in `scripts/` that import `pipeline` / `arms` / `experiments` carry a
+`_REPO_ROOT` `sys.path` bootstrap at the top — preserve it when editing them.
+
+`analyze_logs.py` discovery is **structural, not name-based**: any directory
+containing a `seed_<N>/` subdir with an `optimization_log*.json` counts as an
+experiment, searched recursively to `--max-depth` (default 3) below `--root`.
+So `--root results` sweeps every group in one pass and the descriptively named
+run dirs (`motion-qwen3/`, `q3-empty-llama/`) are included alongside the dated
+`outputs-<date>-<model>/` ones. Dated dirs still yield `date`/`model` fields;
+non-dated ones use the folder name as the experiment label, with the group path
+prefixed if two groups hold a same-named dir.
+
+Two `diagnosis` schemas coexist in the run history and both are parsed
+(`_normalize_diagnosis`): older runs write a dict (`primary_problem`/`severity`,
+HARD label set), protocol runs write a bare soft-label string (`SOFT_DIAGNOSES`,
+no severity). A handful of very early runs contain free-form labels
+(`improving`, `overparameterization`, pipe-joined lists) — these parse fine and
+are flagged `diagnosis_valid=False` rather than dropped.
 
 The LLM agent talks to a local Ollama server via `autogen_ext.models.ollama.OllamaChatCompletionClient`. Make sure `ollama serve` is running and the model tag passed via `--model` is pulled.
 
@@ -80,8 +128,9 @@ Each run writes into the `output_dir` configured by `Config` / `--output` (defau
 ## Conventions specific to this codebase
 
 - Diagnosis labels are the email's SOFT set: `{healthy, possible_overfitting_tendency, possible_underfitting_tendency, plateau, unstable, inconclusive}` (`PROTOCOL_DIAGNOSES` in `arms/labels.py`). The prompt and `RuleBasedOptimizer.propose_setting` share them so the only difference between arms is how a label is acted on.
-- The LLM prompt is rendered as **qualitative labels** (best/good/poor, low/med/high, small/med/large, behavior labels), never raw numbers — small local models parse it more reliably and the protocol mandates it. Raw numbers stay in the per-setting CSV + JSON logs only.
+- The LLM prompt is rendered as **qualitative labels** (best/good/poor, low/med/high, small/med/large, behavior labels), never raw numbers — small local models parse it more reliably and the protocol mandates it. Raw numbers stay in the per-setting CSV + JSON logs only. **The prompt and the input representation are experimental variables, not implementation details** (Email-8): the label rendering is itself under test, since it discards magnitude, ordering and the across-3-trainings uncertainty. Measured, not assumed — `scripts/dump_llm_prompts.py` audits any run and reports 0% of scores / stds / per-seed values reaching the payload as numbers. Every proposer call now records the **verbatim** system prompt and user message (including the retry variant) plus a full-fidelity numeric `history_snapshot`, so "what the LLM saw" is auditable from the logs rather than inferred from the code.
 - Validation is HARD by default (`semantic_repair=False`, the protocol main run): an out-of-grid value, unknown key, arch change while frozen, or already-tried setting is rejected (one retry, then the attempt is wasted — no silent clamp/snap). `--semantic-repair` enables the separate repair-on arm.
 - Scoring is mean validation RMSE over the 3 trainings; "best" is the lowest. The score is in METRES (sqrt of the position MSE on inverse-transformed preds/targets, `val_position_loss_m`) read at the early-stopping best epoch — the same RMSE functional and units as `Evaluator.compute_metrics`' test RMSE — so search selection and the headline final eval agree. (Earlier code scored sqrt of the scaled-space `val_position_loss` over the min of all epochs; that caused an objective mismatch and is superseded.) Pareto/multi-objective and motion loss-shaping levers are DEFERRED from the search space (machinery intact for a later experiment).
 - Early stopping is ENABLED for every arm (protocol): `Trainer.train()` monitors the validation position MSE **in metres** (`val_position_loss_m` — the same metric the search score and headline test RMSE use, so the kept epoch, the score, and the test metric all agree; falls back to scaled `val_loss` only when the metres metric is unavailable that epoch) and stops after `patience` non-improving epochs, then restores the best-epoch weights. `patience` (8/12/16) is a searchable HP that overrides `Config.early_stopping_patience`. Max 100 epochs per training, 25 attempts per method. (Earlier code/notes saying early stopping was disabled and patience removed are superseded by the professor's protocol.)
+- Motion-aware loss shaping is defined in SI units and documented term by term in `Trainer._compute_total_loss` — read that docstring before touching it. Positions entering the loss are **standardised, not metres**; `prev_pos` / `prev_prev_pos` are previous target **position vectors** (renamed from the misleading `prev_y` on 2026-07-26). Displacements convert to metres via `scaler_y.scale_` (train-split std), speed carries `f_s`, acceleration carries `f_s^2`, and each prior is divided by the dataset's reference kinematic (`data.compute_motion_reference`) so `lambda_vel` / `lambda_smooth` are dimensionless and mean the same thing at 3/4/5 Hz. Grid values are unchanged but their MEANING changed on 2026-07-26 — motion-experiment numbers from before that date are not comparable. Both priors are one-step and ground-truth-anchored (teacher-forced), so the acceleration term has a non-zero floor at the true target and biases predictions toward constant-velocity motion; that is a known property, not a bug.
 - File and dir names that look like dates (`outputs-0413-qwen2.5-coder`) follow `MMDD-modeltag` from the run date, not ISO format.

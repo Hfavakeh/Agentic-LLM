@@ -134,7 +134,7 @@ You set six loss-shaping levers, ONLY to one of the listed allowed values:
 What the levers do (this is where human-motion knowledge matters):
   - v_max — plausible top human walking speed in m/s. Predicted steps faster than this are penalised. Set it just above the observed p95 speed (about 1.1x); do not leave a generic default if the data's speed range differs.
   - lambda_vel — strength of that speed-plausibility penalty (0 = off). Raise it when predictions look noisy or the motion is smooth/slow.
-  - lambda_smooth — penalty on physically implausible acceleration/jerk (0 = off). Raise it when the trajectory is smooth and dwell episodes are frequent; keep low when motion is genuinely jerky/fast.
+  - lambda_smooth — penalty on physically implausible acceleration (0 = off). Its scale is relative to this person's own typical acceleration: 0.05 is a light nudge, 0.3 weighs about as much as the position error itself. Raise it when the trajectory is smooth and dwell episodes are frequent; keep low when motion is genuinely jerky/fast.
   - bin_weight_slow / medium / fast — per-speed-regime position-error weights (1.0 = neutral). Up-weight whichever regime the model fits worst (use the per-regime error), e.g. the fast regime when quick movements are hardest.
 
 Neutral levers (lambda_vel=0, lambda_smooth=0, all bin weights 1.0) reduce to plain MSE. Propose a COMPLETE lever vector (all six) that you expect to lower validation error. Do not repeat a lever vector already tried.

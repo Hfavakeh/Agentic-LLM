@@ -487,7 +487,10 @@ class MotionAwareRuleBasedOptimizer(RuleBasedOptimizer):
     # Fixed loss-shaping heuristic constants.
     _V_MAX_MARGIN    = 1.1   # v_max = p95 speed * this margin (same as the LLM recipe)
     _LAMBDA_VEL      = 0.1   # gentle fixed velocity-plausibility weight
-    _LAMBDA_SMOOTH   = 0.1   # gentle fixed smoothness weight
+    # Gentle fixed smoothness weight — the SMALLEST non-zero grid value since the
+    # 2026-07-26 unit fix: the penalty is now a normalised physical acceleration,
+    # so the old 0.1 would make this "gentle" prior as large as the base loss.
+    _LAMBDA_SMOOTH   = 0.05
     _BIN_WEIGHT_FAST = 1.5   # up-weight the rarer / harder fast speed regime
 
     def __init__(self, allow_arch_changes: bool = False):
