@@ -15,6 +15,11 @@ env/
 # Experiment outputs & generated analysis (regenerated per run)
 outputs/
 outputs-*/
+# Post-reorganization homes for the same material: run dirs are now grouped
+# under results/<group>/ and the archived run logs under logs/YYYY-MM/, so the
+# outputs-*/ and *.log rules above no longer match them.
+results/
+logs/
 analysis/
 llm_behavior_analysis/
 _optuna_scratch/
@@ -26,6 +31,11 @@ optuna_cache_*.json
 *.pdf
 *.html
 human_knowledge_report.md
+
+# Relocated / superseded material. Only the move ledger is tracked — it records
+# every relocation and rename of the reorganization so any can be reversed.
+_attic/*
+!_attic/MOVES.csv
 
 # Scratch / console dumps
 main.txt

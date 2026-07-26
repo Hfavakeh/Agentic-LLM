@@ -37,6 +37,11 @@ computes and prints without writing. Original JSONs are backed up to ``*.bak``
 on first write.
 """
 
+import sys as _sys, pathlib as _pathlib
+_REPO_ROOT = _pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
+
 import argparse
 import copy
 import json

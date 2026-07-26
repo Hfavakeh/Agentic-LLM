@@ -18,6 +18,11 @@ or with overrides:
                                        --output outputs-optuna-sweep
 """
 from __future__ import annotations
+
+import sys as _sys, pathlib as _pathlib
+_REPO_ROOT = _pathlib.Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT))
 import argparse, copy, json, time
 from pathlib import Path
 from typing import Any, Dict, List

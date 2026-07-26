@@ -10,8 +10,15 @@ JSONs (`optimization_log_run*.json`, `optimization_log_rule_based_run*.json`,
   4. `analysis/<experiment>/report.md`   — per-experiment narrative report
   5. `analysis/summary.md`               — cross-experiment LLM-as-optimizer analysis
 
+Discovery is recursive: any directory at or below `--root` that contains a
+`seed_<N>/` subdir with an optimisation log counts as an experiment, whatever
+it is named. So `--root results` sweeps every group folder (motion/,
+q3-history/, archive/model-sweep/, ...) in one pass, and the descriptively
+named run dirs are included alongside the dated `outputs-<date>-<model>/` ones.
+
 Run:
-    python analyze_logs.py [--root PATH] [--out analysis]
+    python scripts/analyze_logs.py --root results --out analysis
+    python scripts/analyze_logs.py --root results/motion --out analysis/motion
 """
 
 from __future__ import annotations
@@ -65,7 +72,16 @@ EXPERIMENT_DIR_RE = re.compile(r"^outputs-(?P<date>\d{4})-(?P<model>.+)$")
 SEED_DIR_RE = re.compile(r"^seed_(?P<seed>\d+)$")
 RUN_FILE_RE = re.compile(r"^optimization_log(?:_(?P<agent>rule_based))?_run(?P<run>\d+)\.json$")
 
-ALLOWED_DIAGNOSES = {"overfitting", "underfitting", "plateau", "healthy", "no_data"}
+# Two diagnosis vocabularies appear across the run history:
+#   - the original HARD set, written as a {"primary_problem": ..., "severity": ...} dict
+#   - the protocol's SOFT set (arms/labels.py::PROTOCOL_DIAGNOSES), written as a bare string
+# Both are accepted so old and new runs can be analysed side by side.
+HARD_DIAGNOSES = {"overfitting", "underfitting", "plateau", "healthy", "no_data"}
+SOFT_DIAGNOSES = {
+    "healthy", "possible_overfitting_tendency", "possible_underfitting_tendency",
+    "plateau", "unstable", "inconclusive",
+}
+ALLOWED_DIAGNOSES = HARD_DIAGNOSES | SOFT_DIAGNOSES
 
 
 # ---------------------------------------------------------------------------
@@ -80,29 +96,81 @@ class Experiment:
     path: Path           # absolute experiment dir
 
 
-def discover_experiments(root: Path) -> List[Experiment]:
+# Directories that never contain experiment output — skipped while walking.
+_SKIP_DIR_NAMES = {
+    "logs", "reports", "scripts", "analysis", "_attic", "docs",
+    "pipeline", "arms", "experiments", "reporting",
+    "__pycache__", ".git", ".venv", "venv", ".idea", ".vscode",
+}
+
+
+def _has_seed_logs(d: Path) -> bool:
+    """True if `d` directly contains a seed_<N>/ dir holding an optimisation log."""
+    try:
+        subdirs = [s for s in d.iterdir() if s.is_dir()]
+    except OSError:
+        return False
+    for s in subdirs:
+        if not SEED_DIR_RE.match(s.name):
+            continue
+        try:
+            if any(RUN_FILE_RE.match(f.name) for f in s.iterdir()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def discover_experiments(root: Path, max_depth: int = 3) -> List[Experiment]:
+    """Find every experiment directory at or below `root`.
+
+    An experiment is any directory containing at least one `seed_<N>/` subdir
+    with an optimisation log — this is what identifies it, not its name, so
+    both the dated `outputs-<date>-<model>/` sweeps and the descriptively
+    named runs (`motion-qwen3/`, `q3-empty-llama/`, `prompt-phi/`) are picked
+    up. Recursion lets `--root results` sweep every group folder at once.
+    """
+    found: List[Experiment] = []
+
+    def walk(d: Path, depth: int) -> None:
+        try:
+            children = sorted(c for c in d.iterdir() if c.is_dir())
+        except OSError:
+            return
+        for child in children:
+            if child.name in _SKIP_DIR_NAMES or SEED_DIR_RE.match(child.name):
+                continue
+            if _has_seed_logs(child):
+                m = EXPERIMENT_DIR_RE.match(child.name)
+                if m:
+                    date, model = m.group("date"), m.group("model")
+                    name = f"{date}-{model}"
+                else:
+                    # Non-dated run dir: keep the folder name as the label.
+                    date, model = "", child.name
+                    name = child.name
+                found.append(Experiment(name=name, date=date, model=model, path=child))
+                continue  # an experiment is a leaf — don't descend into it
+            if depth < max_depth:
+                walk(child, depth + 1)
+
+    walk(root, 0)
+
+    # Two groups can hold same-named dirs; prefix those with their group path
+    # so experiment names stay unique (they key the report subdirs and --pair).
+    counts = Counter(e.name for e in found)
     out: List[Experiment] = []
-    for child in sorted(root.iterdir()):
-        if not child.is_dir():
-            continue
-        m = EXPERIMENT_DIR_RE.match(child.name)
-        if not m:
-            continue
-        # Only count experiments that have at least one seed dir with the
-        # expected optimisation log — skips legacy/empty folders.
-        has_log = any(
-            SEED_DIR_RE.match(s.name) and any(RUN_FILE_RE.match(f.name) for f in s.iterdir())
-            for s in child.iterdir() if s.is_dir()
-        )
-        if not has_log:
-            continue
-        out.append(Experiment(
-            name=f"{m.group('date')}-{m.group('model')}",
-            date=m.group("date"),
-            model=m.group("model"),
-            path=child,
-        ))
-    return out
+    for e in found:
+        if counts[e.name] > 1:
+            try:
+                group = e.path.relative_to(root).parent.as_posix().replace("/", "-")
+            except ValueError:
+                group = e.path.parent.name
+            if group and group != ".":
+                e = Experiment(name=f"{group}-{e.name}", date=e.date,
+                               model=e.model, path=e.path)
+        out.append(e)
+    return sorted(out, key=lambda x: x.name)
 
 
 def discover_runs(exp: Experiment) -> List[Tuple[int, int, str, Path]]:
@@ -145,6 +213,21 @@ def _is_finite(x: Any) -> bool:
         return False
 
 
+def _normalize_diagnosis(diag: Any) -> Tuple[Optional[str], Optional[str]]:
+    """Return (primary_problem, severity) from either diagnosis schema.
+
+    Older runs store a dict — {"primary_problem": ..., "severity": ...}.
+    Protocol runs store a bare soft label string, e.g. "inconclusive", and
+    carry no severity. Anything else yields (None, None).
+    """
+    if isinstance(diag, dict):
+        return diag.get("primary_problem"), diag.get("severity")
+    if isinstance(diag, str):
+        d = diag.strip()
+        return (d or None), None
+    return None, None
+
+
 def extract_rounds(
     exp: Experiment,
     seed: int,
@@ -156,8 +239,7 @@ def extract_rounds(
     rounds = payload.get("rounds", []) or []
     out: List[Dict[str, Any]] = []
     for r in rounds:
-        diag = r.get("diagnosis") or {}
-        primary = diag.get("primary_problem")
+        primary, severity = _normalize_diagnosis(r.get("diagnosis"))
         pareto = r.get("pareto") or {}
         weights = pareto.get("weights") or {}
         out.append({
@@ -171,7 +253,7 @@ def extract_rounds(
             "skipped":      bool(r.get("skipped", False)),
             "failure_reason": r.get("failure_reason"),
             "primary_problem": primary,
-            "severity":     diag.get("severity"),
+            "severity":     severity,
             "diagnosis_valid": (primary in ALLOWED_DIAGNOSES) if primary is not None else None,
             "n_changes":    len(r.get("changes_applied") or {}),
             "changes":      r.get("changes_applied") or {},
@@ -818,11 +900,11 @@ def render_summary_report(
 # Driver
 # ---------------------------------------------------------------------------
 
-def build_dataframes(root: Path) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def build_dataframes(root: Path, max_depth: int = 3) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     rounds: List[Dict[str, Any]] = []
     runs: List[Dict[str, Any]] = []
     cross: List[Dict[str, Any]] = []
-    experiments = discover_experiments(root)
+    experiments = discover_experiments(root, max_depth=max_depth)
     for exp in experiments:
         # cross_run_metrics.json (one per seed_dir)
         for seed_dir in sorted(exp.path.iterdir()):
@@ -1016,8 +1098,12 @@ def _pair_to_csv_rows(label: str, contrast: str, r: PairedResult) -> Dict[str, A
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=str(Path(__file__).parent),
-                    help="Project root containing the outputs-* directories.")
+    ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent),
+                    help=("Directory to search for experiment run dirs. Searched "
+                          "recursively, so `--root results` sweeps every group; "
+                          "defaults to the repo root."))
+    ap.add_argument("--max-depth", type=int, default=3,
+                    help="How many directory levels below --root to search (default 3).")
     ap.add_argument("--out", default="analysis",
                     help="Output directory (relative to --root unless absolute).")
     ap.add_argument(
@@ -1044,9 +1130,12 @@ def main() -> None:
     print(f"[info] root        = {root}")
     print(f"[info] output dir  = {out_dir}")
 
-    rounds_df, runs_df, cross_df = build_dataframes(root)
+    rounds_df, runs_df, cross_df = build_dataframes(root, max_depth=args.max_depth)
     if rounds_df.empty:
         print("[warn] no rounds extracted — nothing to do.")
+        print(f"[warn] searched {root} to depth {args.max_depth}; no directory "
+              f"there contains a seed_<N>/ subdir with an optimisation log. "
+              f"Try a different --root or a larger --max-depth.")
         return
 
     print(f"[info] discovered  : {rounds_df['experiment'].nunique()} experiments | "
