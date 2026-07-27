@@ -59,7 +59,8 @@ _BLOCKS = [
 ]
 
 # The numeric quantities the driver has on hand for each past attempt. `shown_as`
-# records what the qualitative payload replaces them with.
+# records what the payload replaces them with — this depends on the
+# representation the run used, so it is resolved per variant (`_shown_as`).
 _QUANTITIES = [
     ("score",              "mean validation RMSE (m)",        "quality label + level n/10"),
     ("val_rmse_std",       "spread across the 3 trainings",   "reliability label"),
@@ -68,6 +69,37 @@ _QUANTITIES = [
     ("mean_val_loss",      "validation loss",                 "gap label"),
     ("mean_train_val_gap", "train/validation gap",            "gap label"),
 ]
+
+# What each representation substitutes for a quantity it does not show as a
+# number. Anything absent from a variant's map keeps the labels-column wording.
+_SHOWN_AS_BY_REPR = {
+    "numeric": {
+        "score": "the number itself", "mean_best_epoch": "the number itself",
+        "mean_train_val_gap": "the number itself",
+        "val_rmse_std": "not shown at all", "per_seed": "not shown at all",
+    },
+    "numeric_ci": {
+        "score": "the number itself", "val_rmse_std": "the number itself",
+        "per_seed": "the 3 values themselves",
+        "mean_best_epoch": "the number itself",
+        "mean_train_val_gap": "the number itself",
+    },
+    "ranks": {k: "rank position only" for k, _d, _s in _QUANTITIES},
+}
+
+
+def _shown_as(key: str, default: str, variants: List[str]) -> str:
+    """Resolve the 'shown as' wording for the variant(s) in this audit.
+
+    Variant labels are '+'-joined tokens ("protocol+numeric_ci+no_anchor"), so
+    match on exact tokens — a substring test would resolve numeric_ci with the
+    numeric map and wrongly report the uncertainty as withheld.
+    """
+    tokens = {tok for v in variants for tok in str(v).split("+")}
+    for mode, mapping in _SHOWN_AS_BY_REPR.items():
+        if mode in tokens:
+            return mapping.get(key, default)
+    return default
 
 
 def _find_logs(run_dir: Path) -> List[Path]:
@@ -192,8 +224,12 @@ def audit_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
                 if not val:
                     continue
                 have += 1
-                # per-seed list: shown only if every element appears
-                seed_vals = [v.get("score") if isinstance(v, dict) else v for v in val]
+                # per-seed list: shown only if every element appears. The driver
+                # stores each training as {"seed": .., "val_rmse": ..}.
+                seed_vals = [
+                    (v.get("val_rmse", v.get("score")) if isinstance(v, dict) else v)
+                    for v in val
+                ]
                 if seed_vals and all(_appears(v, nums) for v in seed_vals):
                     shown += 1
                 continue
@@ -298,11 +334,12 @@ def summarise(df: pd.DataFrame) -> str:
                    "those quantities.")
         out.append("")
     out.append("Numeric information reaching the prompt (over all past attempts referenced):")
+    variants = sorted(set(df["prompt_variant"].astype(str)))
     for key, desc, shown_as in _QUANTITIES:
         have, shown = int(df[f"have_{key}"].sum()), int(df[f"shown_{key}"].sum())
         pct = (100.0 * shown / have) if have else float("nan")
         out.append(f"  {desc:<34s} available {have:5d}  as a number {shown:5d} "
-                   f"({pct:5.1f}%)   -> shown as: {shown_as}")
+                   f"({pct:5.1f}%)   -> shown as: {_shown_as(key, shown_as, variants)}")
     if "condition" in df.columns and df["condition"].nunique() > 1:
         out.append("")
         out.append("Per condition (attempts | mean prompt chars | scores shown as numbers):")

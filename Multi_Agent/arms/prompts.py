@@ -22,6 +22,30 @@ _HP_ORDER = [
     "lstm_hidden", "lstm_layers", "window_size", "optimizer_choice", "patience",
 ]
 
+# ---------------------------------------------------------------------------
+# History REPRESENTATIONS (professor's Email-8, block 3)
+# ---------------------------------------------------------------------------
+# The prompt and the input representation are experimental variables, not
+# implementation details. The default payload renders every outcome as a
+# qualitative label, which discards magnitude, spacing and the uncertainty
+# across the 3 trainings — so "the LLM does not benefit from history" cannot be
+# separated from "the representation destroyed the information" until the
+# alternatives below are run against each other.
+#
+#   labels      the protocol default: quality / reliability / gap / timing
+#               labels plus a 1-10 level. No raw numbers. UNCHANGED — the
+#               rendering is byte-identical to before these variants existed,
+#               so previously collected runs stay comparable.
+#   numeric     the same structure with the measured numbers instead of the
+#               labels: mean validation RMSE in metres, best epoch, gap.
+#               Isolates "magnitude and spacing were discarded".
+#   numeric_ci  numeric PLUS the uncertainty: the spread across the 3 trainings
+#               and the 3 individual seed scores. Isolates "the LLM cannot tell
+#               a reliable difference from a noisy one".
+#   ranks       ordering ONLY (#1 of N) — no score, no label, no level.
+#               Isolates how much of the signal is carried by rank alone.
+PAYLOAD_REPRS = ("labels", "numeric", "numeric_ci", "ranks")
+
 
 def _format_search_space_text(allow_arch_changes: bool = True) -> str:
     lines = []
@@ -33,15 +57,32 @@ def _format_search_space_text(allow_arch_changes: bool = True) -> str:
 
 
 def protocol_system_prompt(allow_arch_changes: bool = True, show_curves: bool = False,
-                           explore: bool = False, show_motion: bool = False) -> str:
+                           explore: bool = False, show_motion: bool = False,
+                           repr_mode: str = "labels", show_anchor: bool = True,
+                           history_window: Any = None,
+                           auto_conclusions: bool = True) -> str:
     """The from-scratch protocol prompt: tune conventional HPs from the
-    qualitative history of tried settings, proposing a small delta vs the
-    best-so-far anchor. No motion levers, no Pareto cost weights.
+    history of tried settings, proposing a small delta vs the best-so-far
+    anchor. No motion levers, no Pareto cost weights.
 
     `explore=True` (Q4 prompt-variant) swaps the "propose a SMALL change vs the
     ANCHOR" instruction for an exploration-oriented one (change several HPs, make
     large moves into untried regions). Used to test whether the anchoring
-    instruction is what caps the LLM's search-grid coverage."""
+    instruction is what caps the LLM's search-grid coverage.
+
+    The remaining arguments are the Email-8 representation variables and MUST
+    agree with what `format_protocol_payload` actually renders — the prompt
+    describes the payload, so a mismatch would tell the model the history
+    contains something it does not:
+      `repr_mode`        one of PAYLOAD_REPRS.
+      `show_anchor`      False removes the ANCHOR block; the model is then asked
+                         for a COMPLETE setting, since there is nothing to take
+                         a delta against.
+      `history_window`   None = every past attempt; N = only the last N.
+      `auto_conclusions` False removes the mined OBSERVED PATTERNS, the derived
+                         behavior labels and the improved/worsened trend arrows,
+                         leaving only the observations themselves.
+    """
     arch_note = (
         "" if allow_arch_changes
         else "\n(NOTE: lstm_hidden and lstm_layers are FIXED this run — do not propose them.)"
@@ -73,9 +114,9 @@ def protocol_system_prompt(allow_arch_changes: bool = True, show_curves: bool = 
 You may change ONLY these hyperparameters, and ONLY to one of the listed allowed values:
 {_format_search_space_text(allow_arch_changes)}{arch_note}
 
-Each setting is trained 3 times (3 fixed seeds) and scored by its MEAN validation RMSE - lower is better. You are shown the best settings so far, the most recent attempts, every setting already tried, and observed patterns, all as qualitative summaries.{curve_note}{motion_note}
+{_history_description(repr_mode, show_anchor, history_window, auto_conclusions)}{curve_note}{motion_note}
 
-{_proposal_instruction(explore)}
+{_proposal_instruction(explore, show_anchor)}
 
 diagnosis: <healthy | possible overfitting tendency | possible underfitting tendency | plateau | unstable | inconclusive>
 strategy: <one short phrase, e.g. increase regularization>
@@ -85,10 +126,65 @@ confidence: <low | medium | high>
 """
 
 
-def _proposal_instruction(explore: bool) -> str:
+def _history_description(repr_mode: str, show_anchor: bool, history_window: Any,
+                         auto_conclusions: bool) -> str:
+    """The sentence describing WHAT the history block contains.
+
+    Kept in lock-step with `format_protocol_payload`: the default wording is the
+    original one (so label runs stay comparable), and each representation
+    variant states exactly what it does and does not carry — including, for
+    `numeric_ci`, that the spread is what separates a real difference from
+    noise, and for `ranks`, that magnitudes are deliberately withheld.
+    """
+    scored = ("Each setting is trained 3 times (3 fixed seeds) and scored by "
+              "its MEAN validation RMSE - lower is better.")
+    blocks = ["the best settings so far", "the most recent attempts",
+              "every setting already tried"]
+    if auto_conclusions:
+        blocks.append("observed patterns")
+    if not show_anchor:
+        blocks[0] = "the settings evaluated so far"
+    listing = ", ".join(blocks[:-1]) + ", and " + blocks[-1]
+
+    if repr_mode == "numeric":
+        how = ("You are shown " + listing + ", with their MEASURED NUMBERS: the "
+               "mean validation RMSE in metres, the epoch training stopped at, "
+               "and the train/validation gap. Compare the numbers directly — "
+               "the differences between settings are yours to judge.")
+    elif repr_mode == "numeric_ci":
+        how = ("You are shown " + listing + ", with their MEASURED NUMBERS and "
+               "their UNCERTAINTY: the mean validation RMSE in metres, the "
+               "spread across the 3 trainings, and the 3 individual seed scores. "
+               "Two settings whose means differ by less than that spread are NOT "
+               "reliably different — treat such a difference as noise rather "
+               "than evidence.")
+    elif repr_mode == "ranks":
+        how = ("You are shown " + listing + ", identified ONLY by their RANK "
+               "(#1 = best). No scores are given, so you can tell which setting "
+               "beat which, but not by how much.")
+    else:
+        how = ("You are shown " + listing + ", all as qualitative summaries.")
+
+    window_note = ""
+    if history_window:
+        window_note = (f" Only the {int(history_window)} most recent attempts are "
+                       "shown with their outcomes; earlier ones appear in the "
+                       "already-tried list without results.")
+    return f"{scored} {how}{window_note}"
+
+
+def _proposal_instruction(explore: bool, show_anchor: bool = True) -> str:
     """The strategic instruction line(s) before the output format. The Q4
     prompt-variant (`explore=True`) replaces the small-delta-vs-anchor framing
-    with an exploration-oriented one."""
+    with an exploration-oriented one; `show_anchor=False` (Email-8) removes the
+    best-so-far reference entirely, so a COMPLETE setting must be given."""
+    if not show_anchor:
+        return (
+            "Propose a COMPLETE setting: give a value for EVERY hyperparameter listed above "
+            "(there is no reference setting to take a delta against). It must differ from every "
+            "setting already tried. "
+            "Respond using EXACTLY these lines, one field per line, no prose, no markdown:"
+        )
     if explore:
         return (
             "EXPLORE the search space: propose a setting in a region you have NOT tried yet. "
@@ -300,22 +396,49 @@ def format_protocol_payload(
     show_curves: bool = False,
     motion_profile: Any = None,
     show_motion: bool = False,
+    repr_mode: str = "labels",
+    show_anchor: bool = True,
+    history_window: Any = None,
+    auto_conclusions: bool = True,
 ) -> str:
-    """Render the qualitative history context the protocol prompt consumes.
+    """Render the history context the protocol prompt consumes.
 
     `history` is the list of attempt records produced by the proposer driver
-    (Step 6b): each has setting, score (mean val RMSE), val_rmse_std,
+    (Step 6b): each has setting, score (mean val RMSE), val_rmse_std, per_seed,
     mean_best_epoch, mean_val_loss, mean_train_val_gap, changes_from_anchor,
-    diagnosis, output_status. All raw numbers are converted to qualitative
-    labels here; the exact values stay in the logs.
+    diagnosis, output_status.
+
+    With the defaults, all raw numbers are converted to qualitative labels and
+    the exact values stay in the logs — the original protocol behaviour, kept
+    byte-identical so runs collected before the Email-8 variants existed remain
+    comparable. The four keyword arguments below select the representation under
+    test; see `PAYLOAD_REPRS` and `protocol_system_prompt`.
+
+    `history_window` deliberately trims only the OUTCOME blocks (best-so-far,
+    recent attempts, mined patterns), never ALREADY TRIED. Hiding the tried set
+    would make the arm burn attempts on duplicates, which would confound "recent
+    vs full history" with a mechanical repeat penalty; the question is whether
+    old OUTCOMES carry usable knowledge, not whether the model can remember what
+    it already spent.
     """
+    if repr_mode not in PAYLOAD_REPRS:
+        raise ValueError(f"repr_mode must be one of {PAYLOAD_REPRS}, got {repr_mode!r}")
     all_scores = [h.get("score") for h in history]
+    # Outcomes are shown for the windowed slice; the tried set stays complete.
+    outcome_history = history[-int(history_window):] if history_window else history
+    ranked_all = sorted(
+        (h for h in outcome_history if is_finite_number(h.get("score"))),
+        key=lambda h: float(h["score"]),
+    )
+    rank_of = {id(h): i + 1 for i, h in enumerate(ranked_all)}
+    n_ranked = len(ranked_all)
     lines: List[str] = []
 
     # ── ANCHOR (best-so-far) ────────────────────────────────────────────────
-    lines.append("== ANCHOR (best setting so far - propose changes relative to this) ==")
-    lines.append("  " + (_setting_line(anchor_setting, allow_arch_changes) or "(fixed-reference defaults)"))
-    lines.append("")
+    if show_anchor:
+        lines.append("== ANCHOR (best setting so far - propose changes relative to this) ==")
+        lines.append("  " + (_setting_line(anchor_setting, allow_arch_changes) or "(fixed-reference defaults)"))
+        lines.append("")
 
     # ── MOTION PROFILE (Q5) — how the tracked person moves ───────────────────
     if show_motion:
@@ -329,19 +452,47 @@ def format_protocol_payload(
         lvl = _qual_level_10(h.get("score"), all_scores)
         return f"{lvl}/10" if lvl is not None else "unknown"
 
+    def _rank_str(h: Dict[str, Any]) -> str:
+        r = rank_of.get(id(h))
+        return f"#{r} of {n_ranked}" if r else "not scored"
+
+    def _outcome_lines(h: Dict[str, Any]) -> List[str]:
+        """The per-setting outcome in the non-label representations."""
+        if repr_mode == "ranks":
+            return [f"    rank: {_rank_str(h)} (#1 = best)"]
+
+        score = h.get("score")
+        out = [f"    validation RMSE: {_fmt_num(score, 4)} m"]
+        if repr_mode == "numeric_ci":
+            std = h.get("val_rmse_std")
+            if is_finite_number(std):
+                out[0] += f" +/- {_fmt_num(std, 2)} (std over 3 trainings)"
+            seeds = [p.get("val_rmse") for p in (h.get("per_seed") or [])
+                     if is_finite_number(p.get("val_rmse"))]
+            if seeds:
+                out.append("    the 3 trainings: "
+                           + ", ".join(_fmt_num(s, 4) for s in seeds))
+        out.append(f"    best epoch: {_fmt_num(h.get('mean_best_epoch'), 3)} of {max_epochs}")
+        out.append(f"    train/validation gap: {_fmt_num(h.get('mean_train_val_gap'), 3)}")
+        return out
+
     def _qual_block(h: Dict[str, Any]) -> List[str]:
         q   = _qual_quality(h.get("score"), all_scores)
         var = _qual_variation(h.get("score"), h.get("val_rmse_std"))
         gap = _qual_gap(h.get("mean_val_loss"), h.get("mean_train_val_gap"))
         tim = _qual_epoch_timing(h.get("mean_best_epoch"), max_epochs)
         beh = _behavior_label(var, gap, q)
-        lines = [
-            f"    validation quality: {q} (level {_level_str(h)}, 1=best 10=worst)",
-            f"    reliability across 3 trainings: {var}",
-            f"    train/validation gap: {gap}",
-            f"    best epoch timing: {tim}",
-            f"    behavior label: {beh.replace('_', ' ')}",
-        ]
+        if repr_mode == "labels":
+            lines = [
+                f"    validation quality: {q} (level {_level_str(h)}, 1=best 10=worst)",
+                f"    reliability across 3 trainings: {var}",
+                f"    train/validation gap: {gap}",
+                f"    best epoch timing: {tim}",
+            ]
+            if auto_conclusions:
+                lines.append(f"    behavior label: {beh.replace('_', ' ')}")
+        else:
+            lines = _outcome_lines(h)
         if show_curves:
             shape = _qual_curve_shape(h.get("curve_summary"))
             if shape != "unknown":
@@ -353,14 +504,15 @@ def format_protocol_payload(
         return lines
 
     # ── Best settings so far (top 5, RANKED best → worst) ─────────────────────
-    ranked = sorted(
-        (h for h in history if is_finite_number(h.get("score"))),
-        key=lambda h: float(h["score"]),
-    )[:5]
-    lines.append("== BEST SETTINGS SO FAR (ranked #1 = best; level 1/10 = best) ==")
+    ranked = ranked_all[:5]
+    header = ("== BEST SETTINGS SO FAR (ranked #1 = best; level 1/10 = best) =="
+              if repr_mode == "labels" else
+              "== BEST SETTINGS SO FAR (ranked #1 = best) ==")
+    lines.append(header)
     if ranked:
         for rank, h in enumerate(ranked, start=1):
-            lines.append(f"  #{rank} [attempt {h.get('attempt')}] (level {_level_str(h)}) "
+            level = f" (level {_level_str(h)})" if repr_mode == "labels" else ""
+            lines.append(f"  #{rank} [attempt {h.get('attempt')}]{level} "
                          f"{_setting_line(h.get('setting', {}), allow_arch_changes)}")
             lines.extend(_qual_block(h))
     else:
@@ -371,8 +523,11 @@ def format_protocol_payload(
     # (oldest → newest). Each line carries the 1-10 quality level and an explicit
     # direction vs the immediately preceding attempt, so the search trajectory is
     # legible without raw numbers.
-    lines.append("== LAST ATTEMPTS (oldest → newest; watch the level trend, 1=best 10=worst) ==")
-    recent = history[-5:]
+    lines.append(
+        "== LAST ATTEMPTS (oldest → newest; watch the level trend, 1=best 10=worst) =="
+        if repr_mode == "labels" else
+        "== LAST ATTEMPTS (oldest → newest) ==")
+    recent = outcome_history[-5:]
     if recent:
         prev_score = None
         for h in recent:
@@ -380,17 +535,25 @@ def format_protocol_payload(
             chg_str = ", ".join(f"{k}={_fmt_grid_val(v)}" for k, v in chg.items()) or "none"
             q = _qual_quality(h.get("score"), all_scores)
             trend = ""
-            if is_finite_number(h.get("score")) and is_finite_number(prev_score):
+            # The arrow is a derived conclusion, not an observation: the Email-8
+            # "raw observations" arm drops it and leaves the reader to compare.
+            if (auto_conclusions and is_finite_number(h.get("score"))
+                    and is_finite_number(prev_score)):
                 trend = ("  ↓ improved" if h["score"] < prev_score * 0.98
                          else "  ↑ worsened" if h["score"] > prev_score * 1.02
                          else "  → about the same")
             beh = _behavior_label(_qual_variation(h.get('score'), h.get('val_rmse_std')),
                                   _qual_gap(h.get('mean_val_loss'), h.get('mean_train_val_gap')), q)
-            lines.append(f"  [attempt {h.get('attempt')}] level {_level_str(h)} ({q}){trend} | changed: {chg_str}")
-            lines.append(f"    reliability: {_qual_variation(h.get('score'), h.get('val_rmse_std'))}"
-                         f"  gap: {_qual_gap(h.get('mean_val_loss'), h.get('mean_train_val_gap'))}"
-                         f"  best epoch: {_qual_epoch_timing(h.get('mean_best_epoch'), max_epochs)}")
-            lines.append(f"    behavior label: {beh.replace('_', ' ')}")
+            if repr_mode == "labels":
+                lines.append(f"  [attempt {h.get('attempt')}] level {_level_str(h)} ({q}){trend} | changed: {chg_str}")
+                lines.append(f"    reliability: {_qual_variation(h.get('score'), h.get('val_rmse_std'))}"
+                             f"  gap: {_qual_gap(h.get('mean_val_loss'), h.get('mean_train_val_gap'))}"
+                             f"  best epoch: {_qual_epoch_timing(h.get('mean_best_epoch'), max_epochs)}")
+                if auto_conclusions:
+                    lines.append(f"    behavior label: {beh.replace('_', ' ')}")
+            else:
+                lines.append(f"  [attempt {h.get('attempt')}]{trend} | changed: {chg_str}")
+                lines.extend(_outcome_lines(h))
             if show_curves:
                 shape = _qual_curve_shape(h.get("curve_summary"))
                 if shape != "unknown":
@@ -416,13 +579,16 @@ def format_protocol_payload(
     lines.append("")
 
     # ── Observed patterns (auto-mined per-value quality) ─────────────────────
-    lines.append("== OBSERVED PATTERNS ==")
-    patterns = _mine_patterns(history, all_scores, allow_arch_changes)
-    if patterns:
-        lines.extend(f"  - {p}" for p in patterns)
-    else:
-        lines.append("  (not enough data yet)")
-    lines.append("")
+    # Automatically generated CONCLUSIONS, not observations: the Email-8
+    # "original observations only" arm removes the block entirely.
+    if auto_conclusions:
+        lines.append("== OBSERVED PATTERNS ==")
+        patterns = _mine_patterns(outcome_history, all_scores, allow_arch_changes)
+        if patterns:
+            lines.extend(f"  - {p}" for p in patterns)
+        else:
+            lines.append("  (not enough data yet)")
+        lines.append("")
 
     lines.append("Respond ONLY in the protocol line format. One field per line. No prose, no markdown.")
     return "\n".join(lines)

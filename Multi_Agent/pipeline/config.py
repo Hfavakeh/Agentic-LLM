@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -138,6 +139,29 @@ class Config:
     # If proposals do not degrade under shuffled/empty vs none, the LLM is
     # ignoring history. Only affects the LLM arm.
     history_ablation: str = "none"
+
+    # Email-8 prompt-representation variables (LLM arm only). The professor's
+    # position is that the payload's rendering is an experimental variable, not
+    # an implementation detail: the label prompt may have destroyed the
+    # magnitude, ordering and uncertainty the LLM would need. Each of these
+    # changes ONE property, with the system prompt kept in lock-step:
+    #   payload_repr             how each outcome is rendered —
+    #                            "labels" (default, unchanged) | "numeric" |
+    #                            "numeric_ci" (adds the 3-training spread and the
+    #                            per-seed scores) | "ranks" (ordering only)
+    #   payload_anchor           False removes the best-so-far ANCHOR block, to
+    #                            test whether it invites imitation rather than
+    #                            inference; proposals must then be complete
+    #   history_window           None = all past outcomes; N = only the last N
+    #                            (recent vs full history). Never trims the
+    #                            already-tried list.
+    #   payload_auto_conclusions False drops the mined OBSERVED PATTERNS, the
+    #                            behavior labels and the trend arrows, leaving
+    #                            the observations without the conclusions
+    payload_repr: str = "labels"
+    payload_anchor: bool = True
+    history_window: Optional[int] = None
+    payload_auto_conclusions: bool = True
 
     def __post_init__(self):
         self.output_dir = Path(self.output_dir)

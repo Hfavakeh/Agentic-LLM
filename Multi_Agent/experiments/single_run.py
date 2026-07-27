@@ -48,6 +48,10 @@ async def run_experiment(
         explore_prompt=getattr(config, "explore_prompt", False),
         payload_motion=getattr(config, "payload_motion", False),
         opro_prompt=getattr(config, "opro_prompt", False),
+        payload_repr=getattr(config, "payload_repr", "labels"),
+        payload_anchor=getattr(config, "payload_anchor", True),
+        history_window=getattr(config, "history_window", None),
+        payload_auto_conclusions=getattr(config, "payload_auto_conclusions", True),
     )
     logger.info("--- Run %d | LLM CONTROLLER (model=%s, attempts=%d × %d trainings) ---",
                 run_id, llm_model, l_cfg.optimization_rounds, len(TRAIN_SEEDS))

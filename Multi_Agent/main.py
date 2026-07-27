@@ -206,6 +206,61 @@ def parse_args():
     )
 
     p.add_argument(
+        "--payload-repr", default="labels", dest="payload_repr",
+        choices=["labels", "numeric", "numeric_ci", "ranks"],
+        help=(
+            "Email-8 representation arm (LLM arm only): how each past outcome is "
+            "rendered in the history the LLM reads. 'labels' (default) is the "
+            "protocol's qualitative summary — unchanged, so earlier runs stay "
+            "comparable. 'numeric' shows the measured mean validation RMSE in "
+            "metres, best epoch and gap. 'numeric_ci' adds the spread across the "
+            "3 trainings and the 3 individual seed scores, so a negligible "
+            "difference can be told from a substantial one. 'ranks' shows the "
+            "ordering only (#1 of N), no magnitudes. The system prompt is kept "
+            "in lock-step with whichever is chosen. A/B on the same --model / "
+            "--seeds to test whether the label rendering, not the LLM, is what "
+            "loses the parameter-outcome relationship."
+        ),
+    )
+
+    p.add_argument(
+        "--no-anchor", action="store_true", dest="no_anchor",
+        help=(
+            "Email-8 anchor ablation (LLM arm only): remove the best-so-far "
+            "ANCHOR block from the payload, testing whether it encourages "
+            "imitation rather than inference. With no anchor there is nothing to "
+            "take a delta against, so proposals must name EVERY hyperparameter; "
+            "incomplete ones are rejected rather than silently completed from the "
+            "hidden anchor (which would leave the arm anchored after all). The "
+            "engine's true best-so-far is unaffected."
+        ),
+    )
+
+    p.add_argument(
+        "--history-window", type=int, default=None, dest="history_window",
+        metavar="N",
+        help=(
+            "Email-8 recent-vs-full history arm (LLM arm only): show OUTCOMES "
+            "for only the last N attempts instead of all of them. The "
+            "already-tried list stays complete, so this measures whether old "
+            "outcomes carry usable knowledge without also imposing a repeat "
+            "penalty. Try 5 against the default (all 25)."
+        ),
+    )
+
+    p.add_argument(
+        "--no-auto-conclusions", action="store_true", dest="no_auto_conclusions",
+        help=(
+            "Email-8 conclusions-vs-observations arm (LLM arm only): drop the "
+            "automatically generated interpretations — the mined OBSERVED "
+            "PATTERNS block, the per-setting behavior labels, and the "
+            "improved/worsened trend arrows — leaving the observations "
+            "themselves. Tests whether the pipeline's own conclusions help or "
+            "replace the LLM's reasoning."
+        ),
+    )
+
+    p.add_argument(
         "--history-ablation", default="none", dest="history_ablation",
         choices=["none", "shuffled", "empty"],
         help=(
@@ -315,6 +370,44 @@ def build_config(args) -> Config:
         logger.info(
             "Payload curves ENABLED (Q2): per-epoch training-curve shape labels "
             "added to the LLM payload and the rule-based diagnosis."
+        )
+
+    # Email-8 representation arms (LLM arm). Each changes ONE property of the
+    # rendered history; the defaults reproduce the protocol payload exactly.
+    cfg.payload_repr = getattr(args, "payload_repr", "labels")
+    cfg.payload_anchor = not bool(getattr(args, "no_anchor", False))
+    cfg.history_window = getattr(args, "history_window", None)
+    cfg.payload_auto_conclusions = not bool(getattr(args, "no_auto_conclusions", False))
+    if cfg.payload_repr != "labels":
+        logger.info(
+            "Payload representation = %s (Email-8): past outcomes are rendered as "
+            "%s instead of qualitative labels.", cfg.payload_repr,
+            {"numeric": "measured numbers",
+             "numeric_ci": "measured numbers with the 3-training spread",
+             "ranks": "rank order only"}[cfg.payload_repr],
+        )
+    if not cfg.payload_anchor:
+        logger.info(
+            "ANCHOR block REMOVED from the payload (Email-8): the LLM must "
+            "propose COMPLETE settings; incomplete proposals are rejected so the "
+            "arm cannot be re-anchored by the validator's merge."
+        )
+    if cfg.history_window:
+        logger.info(
+            "History window = %d (Email-8): outcomes shown for the last %d "
+            "attempts only; the already-tried list stays complete.",
+            cfg.history_window, cfg.history_window,
+        )
+    if not cfg.payload_auto_conclusions:
+        logger.info(
+            "Auto-conclusions REMOVED from the payload (Email-8): no mined "
+            "patterns, behavior labels or trend arrows — observations only."
+        )
+    if cfg.opro_prompt and (cfg.payload_repr != "labels" or not cfg.payload_anchor
+                            or cfg.history_window or not cfg.payload_auto_conclusions):
+        logger.warning(
+            "--opro-prompt uses its own payload and OVERRIDES the Email-8 "
+            "representation flags for the LLM arm."
         )
 
     # Q3 history-use placebo (LLM arm). Default "none" = normal run.

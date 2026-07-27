@@ -79,6 +79,7 @@ def validate_protocol_changes(
     anchor: Dict[str, Any],
     allow_arch_changes: bool,
     is_tried,
+    require_complete: bool = False,
 ) -> tuple:
     """Hard-validate a proposed delta against the grid and the already-tried set.
 
@@ -86,9 +87,20 @@ def validate_protocol_changes(
     short machine tag the retry feedback is built from. No silent repair: an
     out-of-grid value, an unknown key, an arch change while frozen, or a repeat
     all fail (the protocol's hard-validation main run).
+
+    `require_complete=True` is the Email-8 anchor-removed arm: the payload does
+    not show the best-so-far setting, so the proposal must name EVERY searchable
+    hyperparameter. Without this check the merge below would quietly fill the
+    unnamed ones from the true anchor, and the arm would still be anchored —
+    exactly the thing the ablation is meant to remove.
     """
     if not isinstance(changes, dict):
         return None, False, "no_changes_parsed"
+    if require_complete:
+        needed = ALLOWED_HP_KEYS - (set() if allow_arch_changes else ARCH_CHANGE_KEYS)
+        missing = sorted(needed - set(changes))
+        if missing:
+            return None, False, f"incomplete_setting:{','.join(missing)}"
     for k, v in changes.items():
         if k not in ALLOWED_HP_KEYS:
             return None, False, f"unknown_param:{k}"
@@ -170,6 +182,9 @@ def _human_reason(reason: str) -> str:
         return "that setting was already tried; propose a different change."
     if reason == "no_changes_parsed":
         return "no valid 'changes:' line was found."
+    if reason.startswith("incomplete_setting:"):
+        missing = reason.split(":", 1)[1]
+        return (f"give a COMPLETE setting — these are missing: {missing}.")
     return reason
 
 

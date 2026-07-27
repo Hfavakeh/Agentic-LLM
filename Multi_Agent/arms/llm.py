@@ -274,7 +274,10 @@ w_res: <0.0 to 1.0>
                  llm_timeout_s: float = 300.0, history_ablation: str = "none",
                  payload_curves: bool = False, explore_prompt: bool = False,
                  payload_motion: bool = False, opro_prompt: bool = False,
-                 motion_show_profile: bool = True):
+                 motion_show_profile: bool = True,
+                 payload_repr: str = "labels", payload_anchor: bool = True,
+                 history_window: Optional[int] = None,
+                 payload_auto_conclusions: bool = True):
 
         self.client = OllamaChatCompletionClient(
             model=model_name,
@@ -334,6 +337,24 @@ w_res: <0.0 to 1.0>
         # per-regime (slow/med/fast) error label, and the prompt explains them.
         self.payload_motion    = payload_motion
         self.motion_show_profile = motion_show_profile
+        # Email-8 representation variables. The professor's point is that the
+        # payload's rendering is itself under test, so each of these switches ONE
+        # property of the history the LLM reads, with the system prompt kept in
+        # lock-step (`prompts._history_description`):
+        #   payload_repr             labels | numeric | numeric_ci | ranks
+        #   payload_anchor           False removes the best-so-far ANCHOR, to test
+        #                            whether it invites imitation over inference.
+        #                            Proposals must then be COMPLETE settings, or
+        #                            the validator's merge would re-anchor them.
+        #   history_window           N = show outcomes for the last N attempts
+        #                            only (recent vs full history).
+        #   payload_auto_conclusions False drops the mined OBSERVED PATTERNS, the
+        #                            behavior labels and the trend arrows, leaving
+        #                            the observations without the conclusions.
+        self.payload_repr      = payload_repr
+        self.payload_anchor    = payload_anchor
+        self.history_window    = history_window
+        self.payload_auto_conclusions = payload_auto_conclusions
         # OPRO variant (Email-5): when True the LLM arm uses the OPRO meta-prompt
         # + raw (setting, score) trajectory payload instead of the qualitative
         # protocol prompt. Takes precedence over explore_prompt/payload_curves/
@@ -421,6 +442,14 @@ w_res: <0.0 to 1.0>
         if self.opro_prompt:
             return "opro"
         parts = ["protocol"]
+        if self.payload_repr != "labels":
+            parts.append(self.payload_repr)
+        if not self.payload_anchor:
+            parts.append("no_anchor")
+        if self.history_window:
+            parts.append(f"window{int(self.history_window)}")
+        if not self.payload_auto_conclusions:
+            parts.append("no_conclusions")
         if self.explore_prompt:
             parts.append("explore")
         if self.payload_curves:
@@ -479,7 +508,11 @@ w_res: <0.0 to 1.0>
                 if self.opro_prompt else
                 protocol_system_prompt(
                     self.allow_arch_changes, self.payload_curves,
-                    self.explore_prompt, self.payload_motion)
+                    self.explore_prompt, self.payload_motion,
+                    repr_mode=self.payload_repr,
+                    show_anchor=self.payload_anchor,
+                    history_window=self.history_window,
+                    auto_conclusions=self.payload_auto_conclusions)
             )
 
         anchor      = context.get("anchor_setting") or {}
@@ -501,7 +534,11 @@ w_res: <0.0 to 1.0>
             base_user = format_protocol_payload(rendered_history, anchor, max_epochs, allow_arch,
                                                 show_curves=self.payload_curves,
                                                 motion_profile=motion_profile,
-                                                show_motion=self.payload_motion)
+                                                show_motion=self.payload_motion,
+                                                repr_mode=self.payload_repr,
+                                                show_anchor=self.payload_anchor,
+                                                history_window=self.history_window,
+                                                auto_conclusions=self.payload_auto_conclusions)
         feedback = ""
         last_reason = "unknown"
         last_parsed: Dict[str, Any] = {}
@@ -567,6 +604,9 @@ w_res: <0.0 to 1.0>
             sub["diagnosis"] = parsed.get("diagnosis")
             resolved, ok, reason = validate_protocol_changes(
                 parsed.get("proposed_changes", {}), anchor, allow_arch, is_tried,
+                # No anchor shown => nothing to take a delta against, so the
+                # proposal must stand on its own (see validate_protocol_changes).
+                require_complete=not self.payload_anchor,
             )
             sub["status"] = "ok" if ok else reason
             log_entry["sub_attempts"].append(sub)
