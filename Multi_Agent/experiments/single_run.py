@@ -48,6 +48,7 @@ async def run_experiment(
         explore_prompt=getattr(config, "explore_prompt", False),
         payload_motion=getattr(config, "payload_motion", False),
         opro_prompt=getattr(config, "opro_prompt", False),
+        llm_timeout_s=getattr(config, "llm_timeout_s", 300.0),
         payload_repr=getattr(config, "payload_repr", "labels"),
         payload_anchor=getattr(config, "payload_anchor", True),
         history_window=getattr(config, "history_window", None),
@@ -70,6 +71,22 @@ async def run_experiment(
         rs.get("valid_first_try", 0), rs.get("valid_after_retry", 0), rs.get("rejected", 0),
         rs.get("repeats_proposed", 0), rs.get("invalid_values", 0), rs.get("llm_timeouts", 0),
     )
+    # A too-low timeout does not fail the run — it silently gives the LLM arm
+    # fewer trained settings than every other arm, which breaks the equal-budget
+    # comparison. Say so loudly rather than leaving it to be found in the log.
+    timeouts = int(rs.get("llm_timeouts", 0))
+    if timeouts:
+        share = 100.0 * timeouts / max(l_cfg.optimization_rounds, 1)
+        log = logger.warning if share >= 10.0 else logger.info
+        log(
+            "LLM arm lost %d call(s) to the %.0fs timeout (%.0f%% of the %d-attempt "
+            "budget). Attempts that time out are rejected WITHOUT training, so this "
+            "arm searched less than the others. Raise --llm-timeout or use a faster "
+            "model/server before treating these results as comparable.",
+            timeouts, getattr(agent, "llm_timeout_s", 300.0), share,
+            l_cfg.optimization_rounds,
+        )
+
     ts = getattr(agent, "token_stats", {})
     logger.info("LLM token cost | total=%d (prompt=%d completion=%d) over %d call(s)",
                 ts.get("total_tokens", 0), ts.get("prompt_tokens", 0),

@@ -206,6 +206,21 @@ def parse_args():
     )
 
     p.add_argument(
+        "--llm-timeout", type=float, default=None, dest="llm_timeout",
+        metavar="SECONDS",
+        help=(
+            "Seconds to wait for one LLM call before abandoning it (default "
+            "300). A timed-out call is retried once and the attempt is then "
+            "rejected without training, so a ceiling below the server's real "
+            "latency starves the LLM arm while every other arm keeps its full "
+            "25 attempts — the equal-budget comparison silently stops holding. "
+            "Raise it for large models or a CPU-only server: gemma4:12b needed "
+            "~170-300 s per call on the 2026-07-26 run and lost 57% of its "
+            "attempts to the 300 s default."
+        ),
+    )
+
+    p.add_argument(
         "--payload-repr", default="labels", dest="payload_repr",
         choices=["labels", "numeric", "numeric_ci", "ranks"],
         help=(
@@ -291,7 +306,14 @@ def parse_args():
 
 
 def build_config(args) -> Config:
-    cfg = Config()
+    # The dataset must be chosen at CONSTRUCTION, not patched on afterwards.
+    # `Config.__post_init__` is what reads DATASET_SPECS and derives `hz` /
+    # `window_size` (and injects the baseline window into HP_GRID); assigning
+    # `csv_path` to an already-built Config leaves all of that at the radar
+    # default, so a `--data` run would silently train IR at hz=4 / window=12
+    # instead of its spec's hz=5 / window=5. Passing it here also puts the
+    # dataset in place before the --smoke-test early return below.
+    cfg = Config(csv_path=args.data) if getattr(args, "data", None) else Config()
 
     # Apply arch-change toggle early so it is honoured in every code path.
     cfg.allow_arch_changes = not getattr(args, "no_arch_changes", False)
@@ -372,6 +394,19 @@ def build_config(args) -> Config:
             "added to the LLM payload and the rule-based diagnosis."
         )
 
+    # Per-call LLM timeout. Kept visible in the header log because a run whose
+    # ceiling is too low still "succeeds" — it just quietly trains fewer
+    # settings for the LLM arm than for every other arm.
+    if getattr(args, "llm_timeout", None) is not None:
+        if args.llm_timeout <= 0:
+            raise SystemExit("--llm-timeout must be positive")
+        cfg.llm_timeout_s = float(args.llm_timeout)
+        logger.info(
+            "LLM call timeout = %.0fs (default 300s). A timed-out call is "
+            "retried once, then the attempt is rejected without training.",
+            cfg.llm_timeout_s,
+        )
+
     # Email-8 representation arms (LLM arm). Each changes ONE property of the
     # rendered history; the defaults reproduce the protocol payload exactly.
     cfg.payload_repr = getattr(args, "payload_repr", "labels")
@@ -450,8 +485,8 @@ def build_config(args) -> Config:
     if args.epochs is not None:
         cfg.epochs_per_round = args.epochs
         cfg.epochs           = args.epochs
-    if args.data is not None:
-        cfg.csv_path = args.data
+    # NOTE: --data is applied at construction (see the top of this function), not
+    # here — reassigning csv_path at this point would not re-derive hz/window_size.
     if getattr(args, "final_eval_seeds", None) is not None:
         cfg.n_final_eval_seeds = args.final_eval_seeds
     if getattr(args, "no_final_eval", False):
@@ -482,6 +517,7 @@ async def run_motion_over_seeds(config: Config, seeds: List[int], llm_model: str
             model_name=llm_model,
             allow_arch_changes=cfg.allow_arch_changes,
             semantic_repair=getattr(cfg, "semantic_repair", False),
+            llm_timeout_s=getattr(cfg, "llm_timeout_s", 300.0),
             payload_motion=True,
             motion_show_profile=not getattr(cfg, "motion_no_profile", False),
         )

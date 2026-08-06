@@ -158,6 +158,15 @@ class Config:
     #   payload_auto_conclusions False drops the mined OBSERVED PATTERNS, the
     #                            behavior labels and the trend arrows, leaving
     #                            the observations without the conclusions
+    # Seconds to wait for ONE LLM call before giving up on it. A timed-out call
+    # is retried once and then the whole attempt is rejected WITHOUT training,
+    # so a ceiling set below the server's actual latency silently starves the
+    # LLM arm: the 2026-07-26 gemma4:12b sweep lost 57% of its attempts this way
+    # (calls needed ~170-300 s against a 300 s limit) while every other arm kept
+    # its full 25, which breaks the equal-budget comparison. Raise it when the
+    # model is large or the server has no GPU.
+    llm_timeout_s: float = 300.0
+
     payload_repr: str = "labels"
     payload_anchor: bool = True
     history_window: Optional[int] = None
